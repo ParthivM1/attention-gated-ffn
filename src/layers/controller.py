@@ -34,9 +34,21 @@ class LowRankController(nn.Module):
        # m = out_features (usually 4d).
        # We predict u, v vectors to form B = uv^T --> B Is only created when input size (d) is < output size
        self.rows_B = self.m - self.d
+
+       nn.init.zeros_(self.head_A_u.weight)
+       nn.init.zeros_(self.head_A_u.bias)
+       nn.init.zeros_(self.head_A_v.weight)
+       nn.init.zeros_(self.head_A_v.bias)
+       
        if self.rows_B > 0:
            self.head_B_u = nn.Linear(hidden_dim, self.rows_B * rank)
            self.head_B_v = nn.Linear(hidden_dim, self.d * rank)
+
+           # Starts at 0 --> Stable through first iteration
+           nn.init.zeros_(self.head_B_u.weight)
+           nn.init.zeros_(self.head_B_u.bias)
+           nn.init.zeros_(self.head_B_v.weight)
+           nn.init.zeros_(self.head_B_v.bias)
 
 
    def forward(self, z):

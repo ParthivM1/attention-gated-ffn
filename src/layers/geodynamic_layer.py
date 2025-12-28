@@ -22,7 +22,8 @@ class GeoDynamicLayer(nn.Module):
       
        # 2. The Base Weight U_0
        #assume U_0 is on Stiefel(m, d)
-       self.U_0 = nn.Parameter(torch.randn(out_features, in_features))
+       self.U_0 = nn.Parameter(torch.empty(out_features, in_features))
+       nn.init.orthogonal_(self.U_0)
       
        # mark U_0 as manifold for the Trainer to identify
        self.U_0.is_manifold = True
@@ -30,7 +31,7 @@ class GeoDynamicLayer(nn.Module):
 
    def forward(self, x):
        """
-       x: (Batch, Seq_Len, in_features)
+       x: (Batch, Seq_Len, in_features) or (Batch, in_features)
        """
        # 1. Get Global Context for Controller
        # Mean pool over sequence length to get (Batch, d)
@@ -42,30 +43,18 @@ class GeoDynamicLayer(nn.Module):
        # 2. Get A & B from controller
        A, B = self.controller(z)
 
-
-
-
-       # This is where GPT jargon starts - Parthiv edit here
-      
        # 3. MOCK FLOW (Placeholder for Person 1's ODE Solver)
-       # W_approx = U_0 + (U_0 @ A + U_perp @ B) * dt
-       # For the mock, we just project A onto U_0 to verify shapes match.
-      
        # Delta W calculation (Simplified for debugging)
-       # A is (Batch, d, d)
-       # U_0 is (m, d) -> unsqueeze to (1, m, d) for broadcast
-      
        U_0_expanded = self.U_0.unsqueeze(0).expand(z.shape[0], -1, -1)
       
        # Flow term: U_0 @ A
        delta_W = torch.matmul(U_0_expanded, A)
       
        # Add B term if it exists (U_perp part)
-       # For mock, we just add B padded with zeros to match shape, or skip U_perp logic
        if B is not None:
             # B is (Batch, m-d, d). We pad it to (Batch, m, d) for simple testing
             pad = torch.zeros(z.shape[0], self.in_features, self.in_features, device=x.device)
-            B_expanded = torch.cat([pad, B], dim=1) # This is physically wrong but dimensionally valid for testing
+            B_expanded = torch.cat([pad, B], dim=1) 
             # delta_W = delta_W + B_expanded
       
        # Final Dynamic Weight: W(z)
@@ -73,8 +62,11 @@ class GeoDynamicLayer(nn.Module):
       
        # 4. Apply Weights
        # Linear layer: x @ W.T
-       # x: (B, S, d)
-       # W_dynamic: (B, m, d) -> Transpose to (B, d, m)
-      
-       out = torch.matmul(x, W_dynamic.transpose(1, 2))
+       if x.dim() == 2:
+           # (B, d) @ (B, d, m) -> (B, 1, d) @ (B, d, m) -> (B, 1, m) -> (B, m)
+           out = torch.matmul(x.unsqueeze(1), W_dynamic.transpose(1, 2)).squeeze(1)
+       else:
+           # (B, S, d) @ (B, d, m) -> (B, S, m)
+           out = torch.matmul(x, W_dynamic.transpose(1, 2))
+           
        return out
