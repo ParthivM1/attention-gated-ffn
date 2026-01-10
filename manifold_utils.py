@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 import math
-from Geo_math import RiemannianMetric, SpectralAlgebra
+from adjoint_solver import RiemannianMetric, SpectralAlgebra
 
 def clip_grad_norm_riemannian_(parameters, max_norm, norm_type=2):
     if isinstance(parameters, torch.Tensor):
