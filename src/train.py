@@ -27,17 +27,21 @@ def main():
     parser.add_argument("--lr_base", type=float, default=1e-3, help="LR for Manifold U_0")
     parser.add_argument("--lr_controller", type=float, default=1e-4, help="LR for Controller")
     parser.add_argument("--dataset", type=str, default="cifar100", choices=["cifar10", "cifar100", "fake"])
+    parser.add_argument("--save_dir", type=str, default="./checkpoints", help="Directory to save checkpoints")
     args = parser.parse_args()
 
     device = get_device()
     print(f"🚀 Training on device: {device}")
 
+    # Ensure save_dir exists
+    if args.save_dir:
+        os.makedirs(args.save_dir, exist_ok=True)
+
     # 1. Data Setup (Using CIFAR for Dev because ImageNet is too big to download quickly)
     print("Preparing Data...")
     transform = transforms.Compose([
-        transforms.Resize((224, 224)), # Resize small CIFAR images to ViT size
         transforms.ToTensor(),
-        transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5])
+        transforms.Normalize(mean=[0.5071, 0.4867, 0.4408], std=[0.2675, 0.2565, 0.2761])
     ])
 
     if args.dataset == "cifar100":
@@ -51,13 +55,13 @@ def main():
         train_dataset = datasets.FakeData(transform=transform, size=1000)
         num_classes = 10
 
-    train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=2)
+    train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=4, pin_memory=True)
 
     # 2. Model Initialization (Injecting YOUR Geo-Layer)
     print("Initializing Geo-ViT...")
     model = VisionTransformer(
-        img_size=224, 
-        patch_size=16, 
+        img_size=32, 
+        patch_size=8, 
         embed_dim=384,     # ViT-Small size (Friendly for M4 Pro)
         depth=12, 
         num_heads=6, 
@@ -100,6 +104,18 @@ def main():
         
         epoch_time = time.time() - start_time
         print(f"✨ Epoch {epoch+1} Complete in {epoch_time:.1f}s | Avg Loss: {total_loss/len(train_loader):.4f} | Avg Acc: {100.*correct/total:.2f}%")
+        
+        # Save Checkpoint
+        if args.save_dir:
+            ckpt_path = os.path.join(args.save_dir, f"epoch_{epoch+1}.pt")
+            torch.save({
+                'epoch': epoch + 1,
+                'model_state_dict': model.state_dict(),
+                'optimizer_manifold_state': trainer.opt_manifold.state_dict(),
+                'optimizer_euclidean_state': trainer.opt_euclidean.state_dict(),
+            }, ckpt_path)
+            print(f"💾 Checkpoint saved: {ckpt_path}")
+
         print("-" * 50)
 
 if __name__ == "__main__":
