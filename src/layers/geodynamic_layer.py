@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 from .controller import LowRankController
-
+from .adjoint_solver import GeodynamicSolver
 
 # This is where Parthiv comes in Clutch
 class GeoDynamicLayer(nn.Module):
@@ -11,9 +11,9 @@ class GeoDynamicLayer(nn.Module):
        """
        super().__init__()
        self.in_features = in_features # d
-       self.out_features = out_features # m (usually 4d) --> Figure out later
+       self.out_features = out_features # m (usually 4d)
       
-       #Initialize the Controller
+       # Initialize the Controller
        self.controller = LowRankController(
            embed_dim=in_features,
            manifold_dim=out_features,
@@ -21,7 +21,7 @@ class GeoDynamicLayer(nn.Module):
        )
       
        # 2. The Base Weight U_0
-       #assume U_0 is on Stiefel(m, d)
+       # assume U_0 is on Stiefel(m, d)
        self.U_0 = nn.Parameter(torch.empty(out_features, in_features))
        nn.init.orthogonal_(self.U_0)
       
@@ -43,30 +43,35 @@ class GeoDynamicLayer(nn.Module):
        # 2. Get A & B from controller
        A, B = self.controller(z)
 
-       # 3. MOCK FLOW (Placeholder for Person 1's ODE Solver)
-       # Delta W calculation (Simplified for debugging)
-       U_0_expanded = self.U_0.unsqueeze(0).expand(z.shape[0], -1, -1)
-      
-       # Flow term: U_0 @ A
-       delta_W = torch.matmul(U_0_expanded, A)
-      
-       # Add B term if it exists (U_perp part)
+       # 3. Map B to G (Relaxation Term)
        if B is not None:
-            # B is (Batch, m-d, d). We pad it to (Batch, m, d) for simple testing
+            # B is (Batch, m-d, d). Concatenate with zeros to match (Batch, m, d)
             pad = torch.zeros(z.shape[0], self.in_features, self.in_features, device=x.device)
-            B_expanded = torch.cat([pad, B], dim=1) 
-            # delta_W = delta_W + B_expanded
+            G = torch.cat([pad, B], dim=1) 
+       else:
+            # If no B, G is all zeros
+            G = torch.zeros(z.shape[0], self.out_features, self.in_features, device=x.device)
+
+       # 4. Strict ODE Flow using GeodynamicSolver
+       U_0_expanded = self.U_0.unsqueeze(0).expand(z.shape[0], -1, -1)
+       
+       # Parthiv lowkey the GOAT
+       W_dynamic = GeodynamicSolver.apply(
+           U_0_expanded.to(torch.float32), 
+           A.to(torch.float32), 
+           G.to(torch.float32), 
+           4, 
+           'midpoint', 
+           {'tol': 1e-4, 'drift_correction': False}
+       )
       
-       # Final Dynamic Weight: W(z)
-       W_dynamic = U_0_expanded + delta_W # (Batch, m, d)
-      
-       # 4. Apply Weights
+       # 5. Apply Weights
        # Linear layer: x @ W.T
        if x.dim() == 2:
-           # (B, d) @ (B, d, m) -> (B, 1, d) @ (B, d, m) -> (B, 1, m) -> (B, m)
-           out = torch.matmul(x.unsqueeze(1), W_dynamic.transpose(1, 2)).squeeze(1)
+           # (B, d) -> (B, 1, d) @ (B, d, m) -> (B, 1, m) -> (B, m)
+           out = torch.matmul(x.unsqueeze(1), W_dynamic.transpose(-1, -2)).squeeze(1)
        else:
            # (B, S, d) @ (B, d, m) -> (B, S, m)
-           out = torch.matmul(x, W_dynamic.transpose(1, 2))
+           out = torch.matmul(x, W_dynamic.transpose(-1, -2))
            
        return out

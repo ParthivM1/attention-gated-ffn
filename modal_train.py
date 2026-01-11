@@ -7,7 +7,7 @@ app = modal.App("geo-vit-h100-run")
 
 image = (
     modal.Image.debian_slim()
-    .pip_install("torch", "torchvision", "geoopt", "numpy")
+    .pip_install("torch", "torchvision", "geoopt", "numpy", "scipy", "wandb")
     .add_local_dir("./src", remote_path="/root/src")
 )
 
@@ -41,7 +41,8 @@ def train_remote():
         "--save_dir", "/root/checkpoints",
         "--dataset", "cifar100",
         "--epochs", "50",
-        "--batch_size", "64"
+        "--batch_size", "8",       # Physical batch (Small enough for A100)
+        "--grad_accum_steps", "16"   # Accumulate 8 steps (Effective Batch = 128)
     ]
 
     print(f"Executing: {' '.join(cmd)}")
