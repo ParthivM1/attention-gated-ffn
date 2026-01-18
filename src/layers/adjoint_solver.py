@@ -161,77 +161,79 @@ class MuntheKaasRK4Integrator(AbstractIntegrator):
 
 class GeodynamicSolver(Function):
     @staticmethod
-    @custom_fwd(cast_inputs=torch.float32) # <--- CRITICAL FIX: Ensures solver runs in FP32
-    @staticmethod
+    @custom_fwd(cast_inputs=torch.float32)
     def forward(ctx, U0, A, G, steps, method_str, config_dict):
-        # Fast config: Euler only, no drift correction, low step count strongly recommended.
-        # You can still pass steps from the layer; this just keeps the integrator simple.
         config = ManifoldConfig(**config_dict)
-        config.use_drift_correction = False  # critical for speed
-
-        fields = VectorFields(A, G, config)
-
         steps = int(steps)
+        dt = 1.0 / max(1, steps)
+
+        # Save minimal tensors for backward.
         ctx.steps = steps
-        ctx.dt = 1.0 / max(1, steps)
-        ctx.fields = fields
+        ctx.dt = dt
         ctx.config = config
-
-        current_U = U0
-
-        # Save trajectory only as needed (backward uses it).
-        trajectory = [U0]
-
-        for _ in range(steps):
-            # Euler step: U_{t+1} = Cayley(dt * W(U_t)) @ U_t
-            v, W = fields.forward_velocity(current_U)
-            step_op = SpectralAlgebra.cayley_map(ctx.dt * W, chunk=1)
-            current_U = torch.matmul(step_op, current_U)
-            trajectory.append(current_U)
+        ctx.method_str = str(method_str)
 
         ctx.save_for_backward(U0, A, G)
-        ctx.trajectory = trajectory
-        ctx.generators = [None] * steps   # <-- add this line
+
+        # Forward integrate (no Python trajectory retained on ctx)
+        fields = VectorFields(A, G, config)
+        current_U = U0
+        for _ in range(steps):
+            v, W = fields.forward_velocity(current_U)
+            step_op = SpectralAlgebra.cayley_map(dt * W, chunk=1)
+            current_U = torch.matmul(step_op, current_U)
+
         return current_U
 
-
     @staticmethod
-    @custom_bwd # <--- CRITICAL FIX: Handles AMP casting for gradients
+    @custom_bwd
     def backward(ctx, grad_output):
-        U0, A, G = ctx.saved_tensors
-        trajectory = ctx.trajectory
-        generators = ctx.generators
-        config = ctx.config
-        dt = ctx.dt
-        steps = ctx.steps
-        
-        lambda_curr = RiemannianMetric.euclidean_to_riemannian(trajectory[-1], grad_output)
-        
-        grad_A_accum = torch.zeros_like(A)
-        grad_G_accum = torch.zeros_like(G)
-        
-        for i in range(steps - 1, -1, -1):
-            U_t = trajectory[i]
-            
-            if config.use_drift_correction and generators[i] is not None:
-                W_t = generators[i]
-                inv_step = SpectralAlgebra.cayley_map(-dt * W_t)
-                lambda_curr = torch.matmul(inv_step.transpose(-1, -2), lambda_curr)
-            else:
-                lambda_curr = RiemannianMetric.euclidean_to_riemannian(U_t, lambda_curr)
-                
-            lambda_proj = RiemannianMetric.project(U_t, lambda_curr)
-            
-            raw_A_sens = torch.matmul(U_t.transpose(-1, -2), lambda_proj)
-            d_grad_A = SpectralAlgebra.skew(raw_A_sens)
-            
-            UT_lam = torch.matmul(U_t.transpose(-1, -2), lambda_proj)
-            d_grad_G = lambda_proj - torch.matmul(U_t, UT_lam)
-            
-            grad_A_accum += d_grad_A * dt
-            grad_G_accum += d_grad_G * dt
-            
-            d_lam = ctx.fields.adjoint_velocity(lambda_proj, U_t)
-            lambda_curr = lambda_curr - dt * d_lam
-            
-        return lambda_curr, grad_A_accum, grad_G_accum, None, None, None
+        # IMPORTANT: prevent backward from building its own graph (VRAM creep fix)
+        with torch.no_grad():
+            U0, A, G = ctx.saved_tensors
+            steps = ctx.steps
+            dt = ctx.dt
+            config = ctx.config
+
+            # Rebuild fields locally (do not keep ctx.fields references)
+            fields = VectorFields(A, G, config)
+
+            # Recompute states U_t (detached) for adjoint loop
+            # We keep a local list, but it is NOT stored on ctx and uses no_grad -> stable memory.
+            U_states = [U0]
+            current_U = U0
+            for _ in range(steps):
+                v, W = fields.forward_velocity(current_U)
+                step_op = SpectralAlgebra.cayley_map(dt * W, chunk=1)
+                current_U = torch.matmul(step_op, current_U)
+                U_states.append(current_U)
+
+            # Initialize adjoint at final time
+            lambda_curr = RiemannianMetric.euclidean_to_riemannian(U_states[-1], grad_output)
+
+            grad_A_accum = torch.zeros_like(A)
+            grad_G_accum = torch.zeros_like(G)
+
+            # Backward integrate adjoint
+            for i in range(steps - 1, -1, -1):
+                U_t = U_states[i]
+
+                # Project to tangent
+                lambda_proj = RiemannianMetric.project(U_t, lambda_curr)
+
+                # Sensitivities wrt A, G (same as your current logic)
+                raw_A_sens = torch.matmul(U_t.transpose(-1, -2), lambda_proj)
+                d_grad_A = SpectralAlgebra.skew(raw_A_sens)
+
+                UT_lam = torch.matmul(U_t.transpose(-1, -2), lambda_proj)
+                d_grad_G = lambda_proj - torch.matmul(U_t, UT_lam)
+
+                grad_A_accum += d_grad_A * dt
+                grad_G_accum += d_grad_G * dt
+
+                # Adjoint dynamics step
+                d_lam = fields.adjoint_velocity(lambda_proj, U_t)
+                lambda_curr = lambda_curr - dt * d_lam
+
+            # Return grads for (U0, A, G, steps, method_str, config_dict)
+            return lambda_curr, grad_A_accum, grad_G_accum, None, None, None

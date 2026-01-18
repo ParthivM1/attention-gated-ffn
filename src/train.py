@@ -28,8 +28,8 @@ def main():
 
 
     parser.add_argument("--epochs", type=int, default=50)
-    parser.add_argument("--lr_base", type=float, default=1e-3, help="LR for Manifold U_0")
-    parser.add_argument("--lr_controller", type=float, default=1e-4, help="LR for Controller")
+    parser.add_argument("--lr_base", type=float, default=1e-4, help="LR for Manifold U_0")
+    parser.add_argument("--lr_controller", type=float, default=3e-5, help="LR for Controller")
     parser.add_argument("--dataset", type=str, default="cifar100", choices=["cifar10", "cifar100"])
     parser.add_argument("--save_dir", type=str, default="/root/checkpoints", help="Directory to save checkpoints")
     args = parser.parse_args()
@@ -59,13 +59,15 @@ def main():
 
     # Increased num_workers to 8 to feed the GPU faster
     train_loader = DataLoader(
-        train_dataset, 
-        batch_size=args.batch_size, 
-        shuffle=True, 
-        num_workers=4,
+        train_dataset,
+        batch_size=args.batch_size,
+        shuffle=True,
+        num_workers=8,
         pin_memory=True,
-        prefetch_factor=2
+        persistent_workers=True,
+        prefetch_factor=4
     )
+
 
     # 2. Model Initialization
     # Using patch_size=8 for 32x32 images reduces sequence length to 16, saving massive memory
@@ -117,10 +119,18 @@ def main():
                     # Normalize loss by accumulation steps
                     loss = loss / args.grad_accum_steps
 
-                    if device.type == "cuda" and (batch_idx + 1) % 200 == 0:
-                        allocated = torch.cuda.memory_allocated() / (1024**3)
-                        reserved = torch.cuda.memory_reserved() / (1024**3)
-                        print(f"[mem] step {batch_idx+1}: allocated={allocated:.2f}GB reserved={reserved:.2f}GB")
+                    # ---- Fix 4: debugging for instability (every 50 batches) ----
+                    if (batch_idx % 50) == 0:
+                        with torch.no_grad():
+                            logits_abs_max = outputs.detach().abs().max().item()
+                        print(f"[dbg] epoch={epoch+1} batch={batch_idx+1}/{len(train_loader)} logits_abs_max={logits_abs_max:.2f}")
+
+
+                    if device.type == "cuda" and ((batch_idx + 1) % 200 == 0):
+                        alloc = torch.cuda.memory_allocated() / 1024**3
+                        reserv = torch.cuda.memory_reserved() / 1024**3
+                        print(f"[mem-gpu] step {batch_idx+1}: allocated={alloc:.2f}GB reserved={reserv:.2f}GB")
+
 
                 
                 # Backward pass with scaler
@@ -134,16 +144,22 @@ def main():
             # Step ONLY after accumulation period
             if (batch_idx + 1) % args.grad_accum_steps == 0:
                 if scaler:
+                    # Unscale grads so clipping is meaningful
+                    scaler.unscale_(trainer.opt_manifold)
+                    scaler.unscale_(trainer.opt_euclidean)
+
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+
                     scaler.step(trainer.opt_manifold)
                     scaler.step(trainer.opt_euclidean)
                     scaler.update()
                 else:
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
                     trainer.opt_manifold.step()
                     trainer.opt_euclidean.step()
-                
-                # Zero gradients for next accumulation cycle
-                trainer.opt_manifold.zero_grad()
-                trainer.opt_euclidean.zero_grad()
+
+                trainer.opt_manifold.zero_grad(set_to_none=True)
+                trainer.opt_euclidean.zero_grad(set_to_none=True)
 
             # Logging inputs
             total_loss += loss.item() * args.grad_accum_steps # Un-normalize for display

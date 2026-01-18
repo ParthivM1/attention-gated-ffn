@@ -30,51 +30,42 @@ class GeoDynamicLayer(nn.Module):
 
 
    def forward(self, x):
-       """
-       x: (Batch, Seq_Len, in_features) or (Batch, in_features)
-       """
-       # 1. Get Global Context for Controller
-       # Mean pool over sequence length to get (Batch, d)
-       if x.dim() == 3:
-           z = x.mean(dim=1)
-       else:
-           z = x # If input is already 2D
-          
-       # 2. Get A & B from controller
-       A, B = self.controller(z)
+        """
+        x: (Batch, Seq_Len, in_features) or (Batch, in_features)
+        Computes ONE W_dynamic per layer (not per-sample) to avoid OOM/memory creep.
+        """
+        # 1) context z: (B, d)
+        if x.dim() == 3:
+            z = x.mean(dim=1)
+        else:
+            z = x
 
-       # 3. Map B to G (Relaxation Term)
-       if B is not None:
-            # B is (Batch, m-d, d). Concatenate with zeros to match (Batch, m, d)
-            pad = torch.zeros(z.shape[0], self.in_features, self.in_features, device=x.device)
-            G = torch.cat([pad, B], dim=1) 
-       else:
-            # If no B, G is all zeros
-            G = torch.zeros(z.shape[0], self.out_features, self.in_features, device=x.device)
+        # 2) controller outputs per-sample
+        A, B = self.controller(z)  # A: (B,d,d), B: (B, m-d, d) or None
 
-       # 4. Strict ODE Flow using GeodynamicSolver
-       U_0_expanded = self.U_0.unsqueeze(0).expand(z.shape[0], -1, -1)
-       
-       # Parthiv lowkey the GOAT
-       A_mean = A.mean(dim=0)
-       G_mean = G.mean(dim=0)
+        # 3) build G per-sample, then aggregate
+        if B is not None:
+            pad = torch.zeros(z.shape[0], self.in_features, self.in_features, device=x.device, dtype=B.dtype)
+            G = torch.cat([pad, B], dim=1)  # (B, m, d)
+        else:
+            G = torch.zeros(z.shape[0], self.out_features, self.in_features, device=x.device, dtype=A.dtype)
 
-       W_dynamic = GeodynamicSolver.apply(
-            self.U_0.to(torch.float32),
-            A_mean.to(torch.float32),
-            G_mean.to(torch.float32),
-            1,
-            'euler',
-            {'drift_correction': False}
-        )
-      
-       # 5. Apply Weights
-       # Linear layer: x @ W.T
-       if x.dim() == 2:
-           # (B, d) -> (B, 1, d) @ (B, d, m) -> (B, 1, m) -> (B, m)
-           out = torch.matmul(x.unsqueeze(1), W_dynamic.transpose(-1, -2)).squeeze(1)
-       else:
-           # (B, S, d) @ (B, d, m) -> (B, S, m)
-           out = torch.matmul(x, W_dynamic.transpose(-1, -2))
-           
-       return out
+        # 4) AGGREGATE across batch -> single (d,d) and (m,d)
+        A_mean = A.mean(dim=0)          # (d, d)
+        G_mean = G.mean(dim=0)          # (m, d)
+
+        # 5) solve ONCE (no batch dimension)
+        W_dynamic = GeodynamicSolver.apply(
+            self.U_0.to(torch.float32),       # (m, d)
+            A_mean.to(torch.float32),         # (d, d)
+            G_mean.to(torch.float32),         # (m, d)
+            1,                                # steps (fast)
+            "euler",                          # method (fast)
+            {"tol": 1e-4, "drift_correction": False, "max_sv": 10.0}
+        )  # -> (m, d)
+
+        # 6) apply weights
+        if x.dim() == 2:
+            return x @ W_dynamic.transpose(-1, -2)   # (B,d) @ (d,m) -> (B,m)
+        else:
+            return torch.matmul(x, W_dynamic.transpose(-1, -2))  # (B,S,d) @ (d,m) -> (B,S,m)
