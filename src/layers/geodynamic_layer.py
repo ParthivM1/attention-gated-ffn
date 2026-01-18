@@ -56,14 +56,17 @@ class GeoDynamicLayer(nn.Module):
        U_0_expanded = self.U_0.unsqueeze(0).expand(z.shape[0], -1, -1)
        
        # Parthiv lowkey the GOAT
+       A_mean = A.mean(dim=0)
+       G_mean = G.mean(dim=0)
+
        W_dynamic = GeodynamicSolver.apply(
-           U_0_expanded.to(torch.float32), 
-           A.to(torch.float32), 
-           G.to(torch.float32), 
-           4, 
-           'midpoint', 
-           {'tol': 1e-4, 'drift_correction': False}
-       )
+            self.U_0.to(torch.float32),
+            A_mean.to(torch.float32),
+            G_mean.to(torch.float32),
+            1,
+            'euler',
+            {'drift_correction': False}
+        )
       
        # 5. Apply Weights
        # Linear layer: x @ W.T

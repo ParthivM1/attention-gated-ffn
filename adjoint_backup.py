@@ -1,7 +1,6 @@
 import torch
 import torch.nn as nn
 from torch.autograd import Function
-from torch.cuda.amp import custom_fwd, custom_bwd # <--- NEW IMPORT
 from typing import Tuple, Optional, List, Callable, Union, Dict
 import math
 import logging
@@ -26,27 +25,10 @@ class SpectralAlgebra:
         return torch.matmul(A, B) - torch.matmul(B, A)
 
     @staticmethod
-    def cayley_map(W: torch.Tensor, chunk: int = 2) -> torch.Tensor:
-        """
-        Cayley map: (I - 0.5 W)^{-1} (I + 0.5 W)
-        Chunked solve reduces peak workspace; chunk=1 or 2 is fastest-safe for big matrices.
-        """
-        *batch, N, _ = W.shape
-        Wf = W.reshape(-1, N, N)  # [Bflat, N, N]
-        Bflat = Wf.shape[0]
-
-        I = torch.eye(N, device=W.device, dtype=W.dtype).unsqueeze(0)  # [1, N, N]
-        out = torch.empty_like(Wf)
-
-        for s in range(0, Bflat, chunk):
-            Ws = Wf[s : s + chunk]
-            Is = I.expand(Ws.shape[0], N, N)
-            A = Is - 0.5 * Ws
-            B = Is + 0.5 * Ws
-            out[s : s + chunk] = torch.linalg.solve(A, B)
-
-        return out.reshape(*batch, N, N)
-
+    def cayley_map(W: torch.Tensor) -> torch.Tensor:
+        B, N, _ = W.shape
+        Id = torch.eye(N, dtype=W.dtype, device=W.device).unsqueeze(0).expand(B, -1, -1)
+        return torch.linalg.solve(Id - 0.5 * W, Id + 0.5 * W)
 
     @staticmethod
     def inverse_cayley(Q: torch.Tensor) -> torch.Tensor:
@@ -161,42 +143,54 @@ class MuntheKaasRK4Integrator(AbstractIntegrator):
 
 class GeodynamicSolver(Function):
     @staticmethod
-    @custom_fwd(cast_inputs=torch.float32) # <--- CRITICAL FIX: Ensures solver runs in FP32
-    @staticmethod
     def forward(ctx, U0, A, G, steps, method_str, config_dict):
-        # Fast config: Euler only, no drift correction, low step count strongly recommended.
-        # You can still pass steps from the layer; this just keeps the integrator simple.
         config = ManifoldConfig(**config_dict)
-        config.use_drift_correction = False  # critical for speed
-
+        
+        if method_str == 'rk4':
+            integrator = MuntheKaasRK4Integrator()
+        elif method_str == 'midpoint':
+            integrator = MidpointIntegrator()
+        else:
+            integrator = EulerIntegrator()
+            
         fields = VectorFields(A, G, config)
-
-        steps = int(steps)
+        
         ctx.steps = steps
-        ctx.dt = 1.0 / max(1, steps)
+        ctx.dt = 1.0 / steps
+        ctx.integrator = integrator
         ctx.fields = fields
         ctx.config = config
-
+        
         current_U = U0
-
-        # Save trajectory only as needed (backward uses it).
         trajectory = [U0]
-
+        generators = []
+        
         for _ in range(steps):
-            # Euler step: U_{t+1} = Cayley(dt * W(U_t)) @ U_t
-            v, W = fields.forward_velocity(current_U)
-            step_op = SpectralAlgebra.cayley_map(ctx.dt * W, chunk=1)
-            current_U = torch.matmul(step_op, current_U)
+            def closure(u): return fields.forward_velocity(u)
+            
+            if config.use_drift_correction:
+                v, w = closure(current_U)
+                omega_skew = SpectralAlgebra.skew(A)
+                comm = SpectralAlgebra.lie_bracket(omega_skew, w)
+                corr = 0.5 * ctx.dt * torch.matmul(current_U, comm)
+                v_corr = v + corr
+                w_corr = torch.matmul(v_corr, current_U.transpose(-1, -2)) - torch.matmul(current_U, v_corr.transpose(-1, -2))
+                step_op = SpectralAlgebra.cayley_map(ctx.dt * w_corr)
+                current_U = torch.matmul(step_op, current_U)
+                generators.append(w_corr)
+            else:
+                current_U = integrator.step(current_U, ctx.dt, closure)
+                generators.append(None)
+                
             trajectory.append(current_U)
-
+            
         ctx.save_for_backward(U0, A, G)
         ctx.trajectory = trajectory
-        ctx.generators = [None] * steps   # <-- add this line
+        ctx.generators = generators
+        
         return current_U
 
-
     @staticmethod
-    @custom_bwd # <--- CRITICAL FIX: Handles AMP casting for gradients
     def backward(ctx, grad_output):
         U0, A, G = ctx.saved_tensors
         trajectory = ctx.trajectory
@@ -235,3 +229,197 @@ class GeodynamicSolver(Function):
             lambda_curr = lambda_curr - dt * d_lam
             
         return lambda_curr, grad_A_accum, grad_G_accum, None, None, None
+
+class GeodynamicController(nn.Module):
+    def __init__(self, in_dim, hidden_dim, out_dim_A, out_dim_G):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(in_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.Tanh(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, out_dim_A + out_dim_G)
+        )
+        self.init_weights()
+        
+    def init_weights(self):
+        with torch.no_grad():
+            self.net[-1].weight.mul_(0.001)
+            self.net[-1].bias.zero_()
+            
+    def forward(self, x):
+        return self.net(x)
+
+class GeodynamicSpectralLayer(nn.Module):
+    def __init__(self, 
+                 in_features: int, 
+                 out_features: int, 
+                 steps: int = 8, 
+                 method: str = 'rk4',
+                 tol: float = 1e-6,
+                 spectral_limit: float = 10.0):
+        super().__init__()
+        self.in_features = in_features
+        self.out_features = out_features
+        self.steps = steps
+        self.method = method
+        self.config = {'tol': tol, 'max_sv': spectral_limit, 'drift_correction': True}
+        
+        base_W = torch.randn(out_features, in_features)
+        Q, _ = torch.linalg.qr(base_W)
+        self.U0 = nn.Parameter(Q)
+        
+        self.size_A = in_features * in_features
+        self.size_G = out_features * in_features
+        
+        self.controller = GeodynamicController(
+            in_dim=in_features,
+            hidden_dim=in_features // 2,
+            out_dim_A=self.size_A,
+            out_dim_G=self.size_G
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        B, S, D = x.shape
+        x_ctx = x.mean(dim=1)
+        
+        params = self.controller(x_ctx)
+        
+        raw_A = params[:, :self.size_A]
+        raw_G = params[:, self.size_A:]
+        
+        A = raw_A.view(B, self.in_features, self.in_features)
+        G = raw_G.view(B, self.out_features, self.in_features)
+        
+        A = SpectralAlgebra.skew(A)
+        
+        if self.training:
+            A = SpectralAlgebra.complex_spectral_filter(A, self.config['max_sv'])
+        
+        U0_batch = self.U0.unsqueeze(0).expand(B, -1, -1)
+        
+        W_dynamic = GeodynamicSolver.apply(
+            U0_batch, 
+            A, 
+            G, 
+            self.steps, 
+            self.method, 
+            self.config
+        )
+        
+        return torch.einsum('bsi,boi->bso', x, W_dynamic)
+
+class TransportLayer(nn.Module):
+    def __init__(self, dim):
+        super().__init__()
+        self.dim = dim
+        
+    def forward(self, vec, u_start, u_end):
+        p1 = RiemannianMetric.project(u_start, vec)
+        p2 = RiemannianMetric.project(u_end, p1)
+        return p2
+
+class ManifoldRegularizer(nn.Module):
+    def __init__(self, strength=0.01):
+        super().__init__()
+        self.strength = strength
+        
+    def forward(self, A):
+        spec_norm = torch.linalg.norm(A, ord=2, dim=(-2, -1))
+        return self.strength * spec_norm.mean()
+
+def unit_test_geodynamic():
+    B, N, P = 2, 64, 32
+    
+    x = torch.randn(B, 10, P)
+    
+    layer = GeodynamicSpectralLayer(P, N, steps=4, method='rk4')
+    y = layer(x)
+    
+    err = 0.0
+    if torch.isnan(y).any():
+        err = 1.0
+        
+    loss = y.sum()
+    loss.backward()
+    
+    grad_norm = layer.U0.grad.norm().item()
+    
+    print(f"Test Complete. Error: {err}, Grad Norm: {grad_norm}")
+
+class AugmentedODE(nn.Module):
+    def __init__(self, base_layer):
+        super().__init__()
+        self.base = base_layer
+        
+    def forward(self, t, state):
+        u, lam = state
+        fields = VectorFields(self.base.A_curr, self.base.G_curr, ManifoldConfig())
+        du, _ = fields.forward_velocity(u)
+        dlam = fields.adjoint_velocity(lam, u)
+        return du, dlam
+
+class StiefelFlow:
+    def __init__(self, p, n):
+        self.p = p
+        self.n = n
+        
+    def random_point(self):
+        w = torch.randn(self.n, self.p)
+        q, _ = torch.linalg.qr(w)
+        return q
+    
+    def distance(self, u1, u2):
+        m = torch.matmul(u1.transpose(-1, -2), u2)
+        return self.p - torch.trace(m)
+
+class LieGroupIntegrator:
+    def __init__(self, order=4):
+        self.order = order
+        
+    def integrate(self, generator_fn, y0, t_span, steps):
+        dt = (t_span[1] - t_span[0]) / steps
+        y = y0
+        t = t_span[0]
+        for _ in range(steps):
+            k1 = generator_fn(t, y)
+            y_pred = torch.matmul(SpectralAlgebra.cayley_map(0.5*dt*k1), y)
+            k2 = generator_fn(t + 0.5*dt, y_pred)
+            w = dt * k2 
+            y = torch.matmul(SpectralAlgebra.cayley_map(w), y)
+            t += dt
+        return y
+
+def jacobian_check(layer, x, epsilon=1e-4):
+    u0_flat = layer.U0.view(-1)
+    
+    base_out = layer(x).sum()
+    base_out.backward()
+    analytic_grad = layer.U0.grad.view(-1).clone()
+    layer.zero_grad()
+    
+    idx = torch.randint(0, u0_flat.shape[0], (1,)).item()
+    
+    with torch.no_grad():
+        layer.U0.view(-1)[idx] += epsilon
+        pos_out = layer(x).sum()
+        layer.U0.view(-1)[idx] -= 2*epsilon
+        neg_out = layer(x).sum()
+        layer.U0.view(-1)[idx] += epsilon
+        
+    numeric_grad = (pos_out - neg_out) / (2 * epsilon)
+    
+    diff = torch.abs(analytic_grad[idx] - numeric_grad)
+    return diff.item() < 1e-3
+
+class SectionalCurvature:
+    @staticmethod
+    def compute(U, A, B):
+        cov_A = torch.matmul(U, SpectralAlgebra.skew(A))
+        cov_B = torch.matmul(U, SpectralAlgebra.skew(B))
+        commutator = SpectralAlgebra.lie_bracket(cov_A, cov_B)
+        return torch.norm(commutator)
+
+if __name__ == "__main__":
+    unit_test_geodynamic()

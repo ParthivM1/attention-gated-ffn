@@ -23,9 +23,10 @@ def get_device():
 def main():
     parser = argparse.ArgumentParser(description="Train Geo-ViT with Gradient Accumulation")
     # Reduced default batch size to 16 to fit in A100 memory with ODE Solver
-    parser.add_argument("--batch_size", type=int, default=16, help="Physical batch size per step")
-    # Accumulate gradients to simulate a larger batch (e.g., 16 * 8 = 128 effective batch)
-    parser.add_argument("--grad_accum_steps", type=int, default=8, help="Steps to accumulate gradients before update")
+    parser.add_argument("--batch_size", type=int, default=32, help="Physical batch size per step")
+    parser.add_argument("--grad_accum_steps", type=int, default=4, help="Steps to accumulate gradients before update")
+
+
     parser.add_argument("--epochs", type=int, default=50)
     parser.add_argument("--lr_base", type=float, default=1e-3, help="LR for Manifold U_0")
     parser.add_argument("--lr_controller", type=float, default=1e-4, help="LR for Controller")
@@ -61,7 +62,7 @@ def main():
         train_dataset, 
         batch_size=args.batch_size, 
         shuffle=True, 
-        num_workers=8, 
+        num_workers=4,
         pin_memory=True,
         prefetch_factor=2
     )
@@ -70,14 +71,15 @@ def main():
     # Using patch_size=8 for 32x32 images reduces sequence length to 16, saving massive memory
     print("Initializing Geo-ViT...")
     model = VisionTransformer(
-        img_size=32, 
-        patch_size=8, 
-        embed_dim=384,     
-        depth=12, 
-        num_heads=6, 
+        img_size=32,
+        patch_size=16,     # fewer tokens (32x32 with 16 => 4 tokens + cls)
+        embed_dim=192,     # smaller matrices in Cayley map
+        depth=6,           # fewer blocks
+        num_heads=3,       # keep head_dim reasonable
         num_classes=num_classes,
-        linear_layer=GeoDynamicLayer 
+        linear_layer=GeoDynamicLayer
     )
+
     model.to(device)
 
     # 3. Trainer Setup
@@ -102,7 +104,10 @@ def main():
         trainer.opt_euclidean.zero_grad()
         
         for batch_idx, (inputs, targets) in enumerate(train_loader):
-            inputs, targets = inputs.to(device), targets.to(device)
+            batch_start = time.time()
+
+            inputs = inputs.to(device, non_blocking=True)
+            targets = targets.to(device, non_blocking=True)
             
             # Use AMP for speed and memory savings
             if scaler:
@@ -111,6 +116,12 @@ def main():
                     loss = loss_fn(outputs, targets)
                     # Normalize loss by accumulation steps
                     loss = loss / args.grad_accum_steps
+
+                    if device.type == "cuda" and (batch_idx + 1) % 200 == 0:
+                        allocated = torch.cuda.memory_allocated() / (1024**3)
+                        reserved = torch.cuda.memory_reserved() / (1024**3)
+                        print(f"[mem] step {batch_idx+1}: allocated={allocated:.2f}GB reserved={reserved:.2f}GB")
+
                 
                 # Backward pass with scaler
                 scaler.scale(loss).backward()
@@ -139,6 +150,16 @@ def main():
             _, predicted = outputs.max(1)
             total += targets.size(0)
             correct += predicted.eq(targets).sum().item()
+
+            batch_time = time.time() - batch_start
+
+            if batch_idx % 5 == 0 or batch_idx == len(train_loader) - 1:
+                print(
+                    f"[Epoch {epoch+1}/{args.epochs}] "
+                    f"Batch {batch_idx+1}/{len(train_loader)} | "
+                    f"Loss: {loss.item() * args.grad_accum_steps:.4f} | "
+                    f"Batch time: {batch_time:.3f}s"
+                )
 
         # End of Epoch Metrics
         epoch_acc = 100. * correct / total
