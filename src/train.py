@@ -24,7 +24,8 @@ def main():
     parser = argparse.ArgumentParser(description="Train Geo-ViT with Gradient Accumulation")
     # Reduced default batch size to 16 to fit in A100 memory with ODE Solver
     parser.add_argument("--batch_size", type=int, default=64, help="Physical batch size per step")
-    parser.add_argument("--grad_accum_steps", type=int, default=4, help="Steps to accumulate gradients before update")
+    # Make sure says 2
+    parser.add_argument("--grad_accum_steps", type=int, default=2, help="Steps to accumulate gradients before update")
 
 
     parser.add_argument("--epochs", type=int, default=30)
