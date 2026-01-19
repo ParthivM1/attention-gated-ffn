@@ -77,16 +77,22 @@ class LowRankController(nn.Module):
 
        A = 0.01 * A   # start small; you can try 0.03 later
 
-        # If you have a G-like matrix/tensor controlling direction/metric, clamp it too:
-        # (Only apply to the tensor you actually use as G)
-       if 'G' in locals() and G is not None:
-            G = torch.clamp(G, -1.0, 1.0)
-
-        # If you instead output B and later form G = B B^T, scale B:
-       if 'B' in locals() and B is not None:
+        if 'B' in locals() and B is not None:
             B = 0.05 * B
-          
-       return A, B
+            # Clamp B to prevent massive values
+            B = torch.clamp(B, -3.0, 3.0)
+            
+        # Global safety clamp for A
+        A = torch.clamp(A, -3.0, 3.0)
+
+        # Replace NaNs with zeros if any generated (safety net)
+        if torch.isnan(A).any():
+            A = torch.where(torch.isnan(A), torch.zeros_like(A), A)
+            
+        if B is not None and torch.isnan(B).any():
+            B = torch.where(torch.isnan(B), torch.zeros_like(B), B)
+
+        return A, B
 
 
 

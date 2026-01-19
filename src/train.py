@@ -23,11 +23,11 @@ def get_device():
 def main():
     parser = argparse.ArgumentParser(description="Train Geo-ViT with Gradient Accumulation")
     # Reduced default batch size to 16 to fit in A100 memory with ODE Solver
-    parser.add_argument("--batch_size", type=int, default=32, help="Physical batch size per step")
-    parser.add_argument("--grad_accum_steps", type=int, default=4, help="Steps to accumulate gradients before update")
+    parser.add_argument("--batch_size", type=int, default=64, help="Physical batch size per step")
+    parser.add_argument("--grad_accum_steps", type=int, default=2, help="Steps to accumulate gradients before update")
 
 
-    parser.add_argument("--epochs", type=int, default=50)
+    parser.add_argument("--epochs", type=int, default=30)
     parser.add_argument("--lr_base", type=float, default=1e-4, help="LR for Manifold U_0")
     parser.add_argument("--lr_controller", type=float, default=3e-5, help="LR for Controller")
     parser.add_argument("--dataset", type=str, default="cifar100", choices=["cifar10", "cifar100"])
@@ -148,13 +148,13 @@ def main():
                     scaler.unscale_(trainer.opt_manifold)
                     scaler.unscale_(trainer.opt_euclidean)
 
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), 0.5)
 
                     scaler.step(trainer.opt_manifold)
                     scaler.step(trainer.opt_euclidean)
                     scaler.update()
                 else:
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), 0.5)
                     trainer.opt_manifold.step()
                     trainer.opt_euclidean.step()
 

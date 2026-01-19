@@ -1,7 +1,34 @@
 import torch
 import torch.nn as nn
 from torch.autograd import Function
-from torch.cuda.amp import custom_fwd, custom_bwd # <--- NEW IMPORT
+import torch
+
+# --- CROSS-VERSION COMPATIBILITY FOR AMP ---
+# PyTorch 2.4+ requires device_type='cuda'. Older versions crash with it.
+try:
+    from torch.amp import custom_fwd as _cfwd, custom_bwd as _cbwd
+    NEW_AMP_API = True
+except ImportError:
+    from torch.cuda.amp import custom_fwd as _cfwd, custom_bwd as _cbwd
+    NEW_AMP_API = False
+
+def safe_custom_fwd(**kwargs):
+    # Strip device_type if we are on an older PyTorch that doesn't support it
+    # We detect this loosely by checking if we had to import from torch.cuda.amp
+    # OR explicit version check. 
+    if 'device_type' in kwargs:
+        # Check if the function accepts it? inspect is slow.
+        # Simple heuristic: torch 2.4+ needs it.
+        # But safest is just:
+        if torch.__version__ < '2.4':
+            kwargs.pop('device_type')
+    return _cfwd(**kwargs)
+
+def safe_custom_bwd(**kwargs):
+    if 'device_type' in kwargs and torch.__version__ < '2.4':
+        kwargs.pop('device_type')
+    return _cbwd(**kwargs)
+# -------------------------------------------
 from typing import Tuple, Optional, List, Callable, Union, Dict
 import math
 import logging
@@ -41,9 +68,38 @@ class SpectralAlgebra:
         for s in range(0, Bflat, chunk):
             Ws = Wf[s : s + chunk]
             Is = I.expand(Ws.shape[0], N, N)
-            A = Is - 0.5 * Ws
-            B = Is + 0.5 * Ws
-            out[s : s + chunk] = torch.linalg.solve(A, B)
+
+            # 1. NaN Safety Check
+            if torch.isnan(Ws).any():
+                raise RuntimeError(f"Cayley map input 'W' contains NaNs at chunk {s}!")
+
+            # Cast to float64 for stability
+            Ws_d = Ws.double()
+            Is_d = Is.double()
+            
+            # Tikhonov Regularization
+            # norm_W = Ws.norm(dim=(-2,-1), keepdim=True).double() # Check this too if needed?
+            # Safe norm to avoid infs in extreme cases
+            norm_W = torch.linalg.matrix_norm(Ws_d, ord='fro', dim=(-2,-1), keepdim=True)
+            eps = 1e-6 + 1e-4 * norm_W
+            
+            # A = (1+eps)I - 0.5*W
+            # B = (1)I + 0.5*W
+            A = Is_d * (1.0 + eps) - 0.5 * Ws_d
+            B = Is_d + 0.5 * Ws_d
+            
+            # 2. Robust Solve with Fallback
+            try:
+                out_d = torch.linalg.solve(A, B)
+            except RuntimeError as e:
+                # If solve fails (singular), try Least Squares (lstsq) which handles rank-deficient cases
+                # or Pseudo-Inverse.
+                print(f"⚠️ Cayley linalg.solve failed (Singular?): {e}. Fallback to lstsq.", flush=True)
+                solution = torch.linalg.lstsq(A, B).solution
+                out_d = solution
+            
+            # Cast back
+            out[s : s + chunk] = out_d.to(dtype=W.dtype)
 
         return out.reshape(*batch, N, N)
 
@@ -161,7 +217,7 @@ class MuntheKaasRK4Integrator(AbstractIntegrator):
 
 class GeodynamicSolver(Function):
     @staticmethod
-    @custom_fwd(cast_inputs=torch.float32)
+    @safe_custom_fwd(device_type="cuda", cast_inputs=torch.float32)
     def forward(ctx, U0, A, G, steps, method_str, config_dict):
         config = ManifoldConfig(**config_dict)
         steps = int(steps)
@@ -186,7 +242,7 @@ class GeodynamicSolver(Function):
         return current_U
 
     @staticmethod
-    @custom_bwd
+    @safe_custom_bwd(device_type="cuda")
     def backward(ctx, grad_output):
         # IMPORTANT: prevent backward from building its own graph (VRAM creep fix)
         with torch.no_grad():
