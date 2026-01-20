@@ -5,7 +5,6 @@ class HybridTrainer:
     def __init__(self, model, lr_base=1e-3, lr_controller=1e-4):
         self.model = model
 
-        # Sorts through parameters and puts them into the correct list: Controller weights and bias go in euclidian, while the tagged go into manifold params
         manifold_params = []
         euclidean_params = []
         
@@ -15,37 +14,18 @@ class HybridTrainer:
             else:
                 euclidean_params.append(param)
         
-        print(f"Optimizer Setup: {len(manifold_params)} Manifold Params, {len(euclidean_params)} Euclidean Params.")
+        print(f"Optimizer Setup: {len(manifold_params)} Manifold Matrices, {len(euclidean_params)} Euclidean Tensors.")
 
-        # Optimizer UNO: Riemannian Adam (For U_0) --> Manifold Optimizer
+        # Optimizer for U_0 (Riemannian)
         self.opt_manifold = geoopt.optim.RiemannianAdam(
             manifold_params, 
-            lr=lr_base, # Updates Slower although lr is higher as there are fewer layers to amplify update
-            stabilize=10 
+            lr=lr_base, 
+            stabilize=1 
         )
         
-        # Optimizer DOS: AdamW --> Everything else meaning euclidean
+        # Optimizer for Controller (Standard)
         self.opt_euclidean = torch.optim.AdamW(
             euclidean_params, 
-            lr=lr_controller, # Updates Faster as layers amplify update
+            lr=lr_controller, 
             weight_decay=0.05
         )
-        
-    def step(self, loss):
-        # Zero gradients
-        self.opt_manifold.zero_grad()
-        self.opt_euclidean.zero_grad()
-        
-        # Backward
-        loss.backward()
-        
-        # Steps
-        self.opt_euclidean.step()
-        self.opt_manifold.step()
-
-
-
-
-
-# Overall, splits the parameters into manifold and regular (euclidian); 
-# then, assigns corresponding learning rates, and defines the steps for learning

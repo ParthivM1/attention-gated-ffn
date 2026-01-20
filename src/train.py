@@ -5,203 +5,178 @@ from torchvision import datasets, transforms
 import argparse
 import time
 import os
+import re
 
-# Import your modules
 from models.vit import VisionTransformer
 from layers.geodynamic_layer import GeoDynamicLayer
-from trainer import HybridTrainer  # Ensure this path matches your folder structure
+from trainer import HybridTrainer
 
 def get_device():
-    """Auto-detects the best available accelerator."""
-    if torch.cuda.is_available():
-        return torch.device("cuda")
-    elif torch.backends.mps.is_available():
-        return torch.device("mps") # Apple Silicon M-Series
-    else:
-        return torch.device("cpu")
+    if torch.cuda.is_available(): return torch.device("cuda")
+    elif torch.backends.mps.is_available(): return torch.device("mps")
+    return torch.device("cpu")
+
+@torch.no_grad()
+def validate(model, loader, device):
+    model.eval()
+    correct, total, total_loss = 0, 0, 0
+    loss_fn = nn.CrossEntropyLoss()
+    for inputs, targets in loader:
+        inputs, targets = inputs.to(device), targets.to(device)
+        outputs = model(inputs)
+        loss = loss_fn(outputs, targets)
+        total_loss += loss.item()
+        _, predicted = outputs.max(1)
+        total += targets.size(0)
+        correct += predicted.eq(targets).sum().item()
+    return 100. * correct / total, total_loss / len(loader)
 
 def main():
-    parser = argparse.ArgumentParser(description="Train Geo-ViT with Gradient Accumulation")
-    # Reduced default batch size to 16 to fit in A100 memory with ODE Solver
-    parser.add_argument("--batch_size", type=int, default=64, help="Physical batch size per step")
-    # Make sure says 2
-    parser.add_argument("--grad_accum_steps", type=int, default=2, help="Steps to accumulate gradients before update")
-
-
-    parser.add_argument("--epochs", type=int, default=30)
-    parser.add_argument("--lr_base", type=float, default=1e-4, help="LR for Manifold U_0")
-    parser.add_argument("--lr_controller", type=float, default=3e-5, help="LR for Controller")
-    parser.add_argument("--dataset", type=str, default="cifar100", choices=["cifar10", "cifar100"])
-    parser.add_argument("--save_dir", type=str, default="/root/checkpoints", help="Directory to save checkpoints")
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--batch_size", type=int, default=128)
+    parser.add_argument("--grad_accum_steps", type=int, default=1)
+    parser.add_argument("--epochs", type=int, default=50)
+    parser.add_argument("--lr_base", type=float, default=2e-4)       
+    parser.add_argument("--lr_controller", type=float, default=1e-3) 
+    parser.add_argument("--save_dir", type=str, default="/root/checkpoints")
     args = parser.parse_args()
 
     device = get_device()
-    effective_batch_size = args.batch_size * args.grad_accum_steps
-    print(f"🚀 Training on device: {device}")
-    print(f"📉 Config: Physical Batch={args.batch_size} | Accum={args.grad_accum_steps} | Effective Batch={effective_batch_size}")
-
-    # Ensure save_dir exists
     os.makedirs(args.save_dir, exist_ok=True)
 
-    # 1. Data Setup (CIFAR-100 Native Resolution 32x32)
-    # No Resize operation ensures max speed and no CPU bottleneck
-    print("Preparing Data...")
-    transform = transforms.Compose([
+    # CIFAR-100
+    transform_train = transforms.Compose([
+        transforms.RandomCrop(32, padding=4),
+        transforms.RandomHorizontalFlip(),
         transforms.ToTensor(),
-        transforms.Normalize(mean=[0.5071, 0.4867, 0.4408], std=[0.2675, 0.2565, 0.2761])
+        transforms.Normalize((0.5071, 0.4867, 0.4408), (0.2675, 0.2565, 0.2761)),
+    ])
+    transform_test = transforms.Compose([
+        transforms.ToTensor(),
+        transforms.Normalize((0.5071, 0.4867, 0.4408), (0.2675, 0.2565, 0.2761)),
     ])
 
-    if args.dataset == "cifar100":
-        train_dataset = datasets.CIFAR100(root='./data', train=True, download=True, transform=transform)
-        num_classes = 100
-    else:
-        train_dataset = datasets.CIFAR10(root='./data', train=True, download=True, transform=transform)
-        num_classes = 10
+    train_dataset = datasets.CIFAR100(root='./data', train=True, download=True, transform=transform_train)
+    test_dataset = datasets.CIFAR100(root='./data', train=False, download=True, transform=transform_test)
+    
+    train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, 
+                              num_workers=8, pin_memory=True, persistent_workers=True, prefetch_factor=4)
+    test_loader = DataLoader(test_dataset, batch_size=args.batch_size, shuffle=False, num_workers=4)
 
-    # Increased num_workers to 8 to feed the GPU faster
-    train_loader = DataLoader(
-        train_dataset,
-        batch_size=args.batch_size,
-        shuffle=True,
-        num_workers=8,
-        pin_memory=True,
-        persistent_workers=True,
-        prefetch_factor=4
-    )
-
-
-    # 2. Model Initialization
-    # Using patch_size=8 for 32x32 images reduces sequence length to 16, saving massive memory
-    print("Initializing Geo-ViT...")
+    print(f"🚀 Initializing Geo-ViT on {device}...")
     model = VisionTransformer(
-        img_size=32,
-        patch_size=16,     # fewer tokens (32x32 with 16 => 4 tokens + cls)
-        embed_dim=192,     # smaller matrices in Cayley map
-        depth=6,           # fewer blocks
-        num_heads=3,       # keep head_dim reasonable
-        num_classes=num_classes,
+        img_size=32, patch_size=4, embed_dim=192, depth=6, num_heads=6, num_classes=100, 
         linear_layer=GeoDynamicLayer
-    )
+    ).to(device)
 
-    model.to(device)
-
-    # 3. Trainer Setup
-    loss_fn = nn.CrossEntropyLoss()
     trainer = HybridTrainer(model, lr_base=args.lr_base, lr_controller=args.lr_controller)
     
-    # 4. Training Loop
-    print("🏁 Starting Training Loop...")
-    model.train()
+    scheduler_euc = torch.optim.lr_scheduler.CosineAnnealingLR(trainer.opt_euclidean, T_max=args.epochs)
+    scheduler_man = torch.optim.lr_scheduler.CosineAnnealingLR(trainer.opt_manifold, T_max=args.epochs)
     
-    # Enable Automatic Mixed Precision (AMP) for A100 Tensor Cores
+    loss_fn = nn.CrossEntropyLoss()
     scaler = torch.amp.GradScaler('cuda') if device.type == 'cuda' else None
-    
-    for epoch in range(args.epochs):
-        start_time = time.time()
-        total_loss = 0
-        correct = 0
-        total = 0
-        
-        # Zero gradients at the start of the epoch
-        trainer.opt_manifold.zero_grad()
-        trainer.opt_euclidean.zero_grad()
+
+    # --- RESUME LOGIC ---
+    start_epoch = 0
+    if os.path.exists(args.save_dir):
+        files = [f for f in os.listdir(args.save_dir) if f.endswith(".pth")]
+        if files:
+            # Sort by epoch number: geovit_e10.pth
+            try:
+                files.sort(key=lambda x: int(re.search(r'\d+', x).group()))
+                latest = files[-1]
+                ckpt_path = os.path.join(args.save_dir, latest)
+                print(f"🔄 Found checkpoint: {latest}. Loading...")
+                
+                ckpt = torch.load(ckpt_path, map_location=device)
+                
+                # Load Weights
+                if 'model_state_dict' in ckpt:
+                    model.load_state_dict(ckpt['model_state_dict'])
+                    start_epoch = ckpt.get('epoch', 0) + 1
+                    # Attempt load optimizer if exists
+                    if 'opt_manifold' in ckpt:
+                        trainer.opt_manifold.load_state_dict(ckpt['opt_manifold'])
+                        trainer.opt_euclidean.load_state_dict(ckpt['opt_euclidean'])
+                else:
+                    # Legacy load (just weights)
+                    model.load_state_dict(ckpt)
+                    # Infer epoch from filename
+                    match = re.search(r'e(\d+)', latest)
+                    if match:
+                        start_epoch = int(match.group(1))
+                
+                print(f"✅ Resuming training from Epoch {start_epoch+1}")
+                
+                # Fast-forward schedulers to correct epoch
+                for _ in range(start_epoch):
+                    scheduler_euc.step()
+                    scheduler_man.step()
+                    
+            except Exception as e:
+                print(f"⚠️ Failed to resume from checkpoint: {e}")
+                print("   Starting from scratch.")
+
+    # --- TRAINING LOOP ---
+    for epoch in range(start_epoch, args.epochs):
+        model.train()
+        epoch_loss, correct, total = 0, 0, 0
         
         for batch_idx, (inputs, targets) in enumerate(train_loader):
-            batch_start = time.time()
-
-            inputs = inputs.to(device, non_blocking=True)
-            targets = targets.to(device, non_blocking=True)
+            start = time.time()
+            inputs, targets = inputs.to(device), targets.to(device)
             
-            # Use AMP for speed and memory savings
+            trainer.opt_manifold.zero_grad(set_to_none=True)
+            trainer.opt_euclidean.zero_grad(set_to_none=True)
+
             if scaler:
                 with torch.amp.autocast('cuda'):
                     outputs = model(inputs)
                     loss = loss_fn(outputs, targets)
-                    # Normalize loss by accumulation steps
-                    loss = loss / args.grad_accum_steps
-
-                    # ---- Fix 4: debugging for instability (every 50 batches) ----
-                    if (batch_idx % 50) == 0:
-                        with torch.no_grad():
-                            logits_abs_max = outputs.detach().abs().max().item()
-                        print(f"[dbg] epoch={epoch+1} batch={batch_idx+1}/{len(train_loader)} logits_abs_max={logits_abs_max:.2f}")
-
-
-                    if device.type == "cuda" and ((batch_idx + 1) % 200 == 0):
-                        alloc = torch.cuda.memory_allocated() / 1024**3
-                        reserv = torch.cuda.memory_reserved() / 1024**3
-                        print(f"[mem-gpu] step {batch_idx+1}: allocated={alloc:.2f}GB reserved={reserv:.2f}GB")
-
-
                 
-                # Backward pass with scaler
                 scaler.scale(loss).backward()
+                scaler.unscale_(trainer.opt_euclidean)
+                scaler.unscale_(trainer.opt_manifold)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                scaler.step(trainer.opt_manifold)
+                scaler.step(trainer.opt_euclidean)
+                scaler.update()
             else:
                 outputs = model(inputs)
                 loss = loss_fn(outputs, targets)
-                loss = loss / args.grad_accum_steps
                 loss.backward()
-            
-            # Step ONLY after accumulation period
-            if (batch_idx + 1) % args.grad_accum_steps == 0:
-                if scaler:
-                    # Unscale grads so clipping is meaningful
-                    scaler.unscale_(trainer.opt_manifold)
-                    scaler.unscale_(trainer.opt_euclidean)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                trainer.opt_manifold.step()
+                trainer.opt_euclidean.step()
 
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), 0.5)
-
-                    scaler.step(trainer.opt_manifold)
-                    scaler.step(trainer.opt_euclidean)
-                    scaler.update()
-                else:
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), 0.5)
-                    trainer.opt_manifold.step()
-                    trainer.opt_euclidean.step()
-
-                trainer.opt_manifold.zero_grad(set_to_none=True)
-                trainer.opt_euclidean.zero_grad(set_to_none=True)
-
-            # Logging inputs
-            total_loss += loss.item() * args.grad_accum_steps # Un-normalize for display
+            batch_time = time.time() - start
+            epoch_loss += loss.item()
             _, predicted = outputs.max(1)
             total += targets.size(0)
             correct += predicted.eq(targets).sum().item()
 
-            batch_time = time.time() - batch_start
+            if (batch_idx + 1) % 50 == 0:
+                print(f"Epoch [{epoch+1}] Step [{batch_idx+1}/{len(train_loader)}] "
+                      f"Loss: {loss.item():.4f} | Acc: {100.*correct/total:.2f}% | Time: {batch_time:.3f}s")
 
-            if batch_idx % 5 == 0 or batch_idx == len(train_loader) - 1:
-                print(
-                    f"[Epoch {epoch+1}/{args.epochs}] "
-                    f"Batch {batch_idx+1}/{len(train_loader)} | "
-                    f"Loss: {loss.item() * args.grad_accum_steps:.4f} | "
-                    f"Batch time: {batch_time:.3f}s"
-                )
-
-        # End of Epoch Metrics
-        epoch_acc = 100. * correct / total
-        epoch_loss = total_loss / len(train_loader)
-        epoch_time = time.time() - start_time
+        val_acc, val_loss = validate(model, test_loader, device)
+        scheduler_euc.step()
+        scheduler_man.step()
         
-        print(f"Epoch [{epoch+1}/{args.epochs}] | "
-              f"Time: {epoch_time:.1f}s | "
-              f"Loss: {epoch_loss:.4f} | "
-              f"Acc: {epoch_acc:.2f}%")
+        print(f"✨ Epoch {epoch+1} Done | Val Acc: {val_acc:.2f}% | Val Loss: {val_loss:.4f}")
         
-        # Checkpoint (Save every 5 epochs)
+        # Save Full State
         if (epoch + 1) % 5 == 0:
-            ckpt_path = os.path.join(args.save_dir, f"geovit_e{epoch+1}.pth")
+            save_path = os.path.join(args.save_dir, f"geovit_e{epoch+1}.pth")
             torch.save({
                 'epoch': epoch,
                 'model_state_dict': model.state_dict(),
                 'opt_manifold': trainer.opt_manifold.state_dict(),
                 'opt_euclidean': trainer.opt_euclidean.state_dict(),
-                'acc': epoch_acc
-            }, ckpt_path)
-            print(f"✅ Saved checkpoint to {ckpt_path}")
-            
-    print("Training Complete.")
-
+                'acc': val_acc
+            }, save_path)
+            print(f"💾 Checkpoint saved: {save_path}")
 
 if __name__ == "__main__":
     main()
