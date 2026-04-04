@@ -6,17 +6,30 @@ from .controller import LowRankController
 
 
 class GeoDynamicLayer(nn.Module):
-    def __init__(self, in_features, out_features, rank=8, num_steps=4, max_velocity=1.5, bias=True, **kwargs):
+    def __init__(
+        self,
+        in_features,
+        out_features,
+        rank=8,
+        num_steps=4,
+        max_velocity=1.5,
+        bias=True,
+        controller_hidden_dim=64,
+        controller_pool="cls",
+        **kwargs,
+    ):
         super().__init__()
         self.in_features = in_features
         self.out_features = out_features
         self.num_steps = num_steps
         self.max_velocity = max_velocity
+        self.controller_pool = controller_pool
 
         self.controller = LowRankController(
             embed_dim=in_features,
             manifold_dim=out_features,
             rank=rank,
+            hidden_dim=controller_hidden_dim,
         )
 
         self.U_0 = nn.Parameter(torch.empty(out_features, in_features))
@@ -24,8 +37,17 @@ class GeoDynamicLayer(nn.Module):
         self.U_0.is_manifold = True
         self.bias = nn.Parameter(torch.zeros(out_features)) if bias else None
 
+    def _conditioning_signal(self, x):
+        if x.dim() != 3:
+            return x
+        if self.controller_pool == "cls":
+            return x[:, 0]
+        if self.controller_pool == "mean":
+            return x.mean(dim=1)
+        raise ValueError(f"Unsupported controller_pool: {self.controller_pool}")
+
     def _build_geodynamic_controls(self, x):
-        z = x.mean(dim=1) if x.dim() == 3 else x
+        z = self._conditioning_signal(x)
         A, B = self.controller(z)
 
         if B is not None:

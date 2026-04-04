@@ -21,6 +21,23 @@ class DropPath(nn.Module):
         return drop_path(x, self.drop_prob, self.training)
 
 
+class ConvStem(nn.Module):
+    def __init__(self, embed_dim, patch_size, stem_channels=64):
+        super().__init__()
+        self.proj = nn.Sequential(
+            nn.Conv2d(3, stem_channels, kernel_size=3, stride=1, padding=1, bias=False),
+            nn.BatchNorm2d(stem_channels),
+            nn.GELU(),
+            nn.Conv2d(stem_channels, stem_channels, kernel_size=3, stride=1, padding=1, bias=False),
+            nn.BatchNorm2d(stem_channels),
+            nn.GELU(),
+            nn.Conv2d(stem_channels, embed_dim, kernel_size=patch_size, stride=patch_size),
+        )
+
+    def forward(self, x):
+        return self.proj(x)
+
+
 class Attention(nn.Module):
     def __init__(self, dim, num_heads=8, qkv_bias=False, linear_layer=nn.Linear):
         super().__init__()
@@ -91,20 +108,33 @@ class VisionTransformer(nn.Module):
         num_heads=6,
         num_classes=100,
         linear_layer=nn.Linear,
+        block_linear_layers=None,
         drop_path_rate=0.1,
         qkv_bias=False,
+        use_conv_stem=False,
+        stem_channels=64,
     ):
         super().__init__()
         self.num_patches = (img_size // patch_size) ** 2
 
-        self.patch_embed = nn.Conv2d(3, embed_dim, kernel_size=patch_size, stride=patch_size)
+        if use_conv_stem:
+            self.patch_embed = ConvStem(embed_dim=embed_dim, patch_size=patch_size, stem_channels=stem_channels)
+        else:
+            self.patch_embed = nn.Conv2d(3, embed_dim, kernel_size=patch_size, stride=patch_size)
         self.cls_token = nn.Parameter(torch.zeros(1, 1, embed_dim))
         self.pos_embed = nn.Parameter(torch.zeros(1, self.num_patches + 1, embed_dim))
         self.pos_drop = nn.Dropout(p=0.0)
 
         dpr = [x.item() for x in torch.linspace(0, drop_path_rate, depth)]
+        if block_linear_layers is None:
+            block_linear_layers = [linear_layer for _ in range(depth)]
+        if len(block_linear_layers) != depth:
+            raise ValueError(f"Expected {depth} block linear layers, got {len(block_linear_layers)}")
         self.blocks = nn.ModuleList(
-            [Block(dim=embed_dim, num_heads=num_heads, drop_path=dpr[i], linear_layer=linear_layer) for i in range(depth)]
+            [
+                Block(dim=embed_dim, num_heads=num_heads, drop_path=dpr[i], linear_layer=block_linear_layers[i])
+                for i in range(depth)
+            ]
         )
 
         self.norm = nn.LayerNorm(embed_dim)

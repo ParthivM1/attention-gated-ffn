@@ -6,8 +6,7 @@ import torch.nn as nn
 from torch.utils.data import DataLoader
 from torchvision import datasets, transforms
 
-from layers.geodynamic_layer import GeoDynamicLayer
-from models.vit import VisionTransformer
+from model_factory import add_model_args, build_model, config_from_args, config_from_checkpoint, count_parameters
 
 
 def get_device():
@@ -24,6 +23,8 @@ def main():
     parser.add_argument("--dataset", type=str, default="cifar100")
     parser.add_argument("--checkpoint_dir", type=str, default="/root/checkpoints")
     parser.add_argument("--checkpoint_name", type=str, default=None, help="Specific .pth file to load")
+    parser.add_argument("--eval_weights", type=str, choices=("auto", "model", "ema"), default="auto")
+    add_model_args(parser)
     args = parser.parse_args()
 
     device = get_device()
@@ -44,17 +45,6 @@ def main():
         num_classes = 10
 
     test_loader = DataLoader(test_dataset, batch_size=args.batch_size, shuffle=False, num_workers=4)
-
-    model = VisionTransformer(
-        img_size=32,
-        patch_size=4,
-        embed_dim=192,
-        depth=6,
-        num_heads=6,
-        num_classes=num_classes,
-        linear_layer=GeoDynamicLayer,
-        drop_path_rate=0.1,
-    ).to(device)
 
     if args.checkpoint_name:
         ckpt_path = os.path.join(args.checkpoint_dir, args.checkpoint_name)
@@ -78,12 +68,31 @@ def main():
 
     print(f"Loading checkpoint: {ckpt_path}")
     checkpoint = torch.load(ckpt_path, map_location=device)
+    checkpoint_config = checkpoint.get("model_config", {})
+    if checkpoint_config:
+        model_config = config_from_checkpoint(checkpoint_config, num_classes=num_classes)
+        print(f"Restoring model from checkpoint config: {model_config['model_variant']}")
+    else:
+        model_config = config_from_args(args, num_classes=num_classes)
+        print(f"Checkpoint has no model config. Using CLI/default config: {model_config['model_variant']}")
+
+    model = build_model(model_config).to(device)
+    total_params, trainable_params = count_parameters(model)
+    print(f"Model parameters: total={total_params:,} trainable={trainable_params:,}")
 
     if "model_state_dict" in checkpoint:
-        model.load_state_dict(checkpoint["model_state_dict"])
+        if args.eval_weights == "model":
+            state_key = "model_state_dict"
+        elif args.eval_weights == "ema":
+            if "ema_state_dict" not in checkpoint:
+                raise ValueError("Checkpoint does not contain EMA weights. Re-run with --eval_weights model or auto.")
+            state_key = "ema_state_dict"
+        else:
+            state_key = "ema_state_dict" if "ema_state_dict" in checkpoint else "model_state_dict"
+        model.load_state_dict(checkpoint[state_key])
         epoch = checkpoint.get("epoch", -1)
         train_acc = checkpoint.get("acc", 0.0)
-        print(f"   -> Loaded state from Epoch {epoch + 1} (val acc at save: {train_acc:.2f}%)")
+        print(f"   -> Loaded {state_key} from Epoch {epoch + 1} (val acc at save: {train_acc:.2f}%)")
     else:
         model.load_state_dict(checkpoint)
 

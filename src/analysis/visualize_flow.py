@@ -5,21 +5,13 @@ import os
 # Add parent directory to path to import modules
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../")))
 
-from models.vit import VisionTransformer
 from layers.geodynamic_layer import GeoDynamicLayer
+from model_factory import DEFAULT_MODEL_CONFIG, build_model
 
 def main():
     print("🔹 Initializing Model Structure...")
-    # Initialize with default args matching training (ViT-Small)
-    model = VisionTransformer(
-        img_size=224, 
-        patch_size=16, 
-        embed_dim=384,
-        depth=12, 
-        num_heads=6, 
-        num_classes=100, 
-        linear_layer=GeoDynamicLayer 
-    )
+    model_config = dict(DEFAULT_MODEL_CONFIG)
+    model = build_model(model_config)
     
     # Check for a local checkpoint (Optional example logic)
     # In a real analysis flow, you would pass this as an arg
@@ -63,7 +55,7 @@ def main():
     handle = target_layer.controller.register_forward_hook(hook_fn)
 
     # 3. Run Dummy Pass
-    val_input = torch.randn(2, 3, 224, 224) # Batch size of 2
+    val_input = torch.randn(2, 3, model_config["img_size"], model_config["img_size"])
     print(f"   Running forward pass with input: {val_input.shape}")
     
     model.eval()
