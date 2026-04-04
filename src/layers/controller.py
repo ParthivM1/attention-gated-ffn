@@ -1,17 +1,20 @@
+import math
+
 import torch
 import torch.nn as nn
 
 
 class LowRankController(nn.Module):
-    def __init__(self, embed_dim, manifold_dim, rank=8, hidden_dim=64):
+    def __init__(self, embed_dim, manifold_dim, rank=8, hidden_dim=64, input_dim=None):
         super().__init__()
         self.d = embed_dim
         self.m = manifold_dim
         self.rank = rank
+        self.input_dim = input_dim or embed_dim
 
         self.net = nn.Sequential(
-            nn.Linear(embed_dim, hidden_dim),
-            nn.LayerNorm(hidden_dim),
+            nn.LayerNorm(self.input_dim),
+            nn.Linear(self.input_dim, hidden_dim),
             nn.GELU(),
             nn.Linear(hidden_dim, hidden_dim),
             nn.GELU(),
@@ -50,3 +53,31 @@ class LowRankController(nn.Module):
             B = torch.tanh(B * 0.1) * scale
 
         return A, B
+
+
+class ResidualTangentController(nn.Module):
+    def __init__(self, input_dim, num_bases, hidden_dim=192, gate_bias=-1.5):
+        super().__init__()
+        self.num_bases = num_bases
+
+        self.net = nn.Sequential(
+            nn.LayerNorm(input_dim),
+            nn.Linear(input_dim, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.GELU(),
+        )
+        self.coeff_head = nn.Linear(hidden_dim, num_bases)
+        self.gate_head = nn.Linear(hidden_dim, 1)
+
+        with torch.no_grad():
+            self.coeff_head.weight.mul_(0.02)
+            self.coeff_head.bias.zero_()
+            self.gate_head.weight.zero_()
+            self.gate_head.bias.fill_(gate_bias)
+
+    def forward(self, z):
+        feat = self.net(z)
+        coeff = torch.tanh(self.coeff_head(feat)) / math.sqrt(max(self.num_bases, 1))
+        gate = torch.sigmoid(self.gate_head(feat))
+        return coeff, gate

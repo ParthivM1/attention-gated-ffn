@@ -2,7 +2,7 @@ from functools import partial
 
 import torch.nn as nn
 
-from layers.geodynamic_layer import GeoDynamicLayer
+from layers.geodynamic_layer import FlowGeoDynamicLayer, GeoDynamicLayer
 from models.vit import VisionTransformer
 
 
@@ -15,31 +15,40 @@ DEFAULT_MODEL_CONFIG = {
     "num_classes": 100,
     "drop_path_rate": 0.1,
     "model_variant": "allgeo",
-    "geo_rank": 8,
-    "geo_hidden_dim": 64,
+    "geo_layer_type": "residual",
+    "geo_rank": 12,
+    "geo_num_bases": 16,
+    "geo_hidden_dim": 192,
     "geo_num_steps": 4,
     "geo_max_velocity": 1.5,
-    "controller_pool": "cls",
+    "geo_residual_scale": 1.0,
+    "controller_pool": "cls_mean_var",
     "use_conv_stem": True,
     "stem_channels": 64,
 }
 
 LEGACY_MODEL_OVERRIDES = {
+    "geo_layer_type": "flow",
     "controller_pool": "mean",
     "use_conv_stem": False,
     "stem_channels": 64,
 }
 
 MODEL_VARIANTS = ("plain", "last1", "last2", "allgeo")
+GEO_LAYER_TYPES = ("flow", "residual")
+CONTROLLER_POOL_CHOICES = ("cls", "mean", "cls_mean", "cls_mean_var")
 
 
 def add_model_args(parser):
     parser.add_argument("--model_variant", type=str, choices=MODEL_VARIANTS, default=DEFAULT_MODEL_CONFIG["model_variant"])
+    parser.add_argument("--geo_layer_type", type=str, choices=GEO_LAYER_TYPES, default=DEFAULT_MODEL_CONFIG["geo_layer_type"])
     parser.add_argument("--geo_rank", type=int, default=DEFAULT_MODEL_CONFIG["geo_rank"])
+    parser.add_argument("--geo_num_bases", type=int, default=DEFAULT_MODEL_CONFIG["geo_num_bases"])
     parser.add_argument("--geo_hidden_dim", type=int, default=DEFAULT_MODEL_CONFIG["geo_hidden_dim"])
     parser.add_argument("--geo_num_steps", type=int, default=DEFAULT_MODEL_CONFIG["geo_num_steps"])
     parser.add_argument("--geo_max_velocity", type=float, default=DEFAULT_MODEL_CONFIG["geo_max_velocity"])
-    parser.add_argument("--controller_pool", type=str, choices=("cls", "mean"), default=DEFAULT_MODEL_CONFIG["controller_pool"])
+    parser.add_argument("--geo_residual_scale", type=float, default=DEFAULT_MODEL_CONFIG["geo_residual_scale"])
+    parser.add_argument("--controller_pool", type=str, choices=CONTROLLER_POOL_CHOICES, default=DEFAULT_MODEL_CONFIG["controller_pool"])
     parser.add_argument("--use_conv_stem", action="store_true", default=DEFAULT_MODEL_CONFIG["use_conv_stem"])
     parser.add_argument("--no_conv_stem", action="store_false", dest="use_conv_stem")
     parser.add_argument("--stem_channels", type=int, default=DEFAULT_MODEL_CONFIG["stem_channels"])
@@ -51,10 +60,13 @@ def config_from_args(args, num_classes=None):
     config.update(
         {
             "model_variant": args.model_variant,
+            "geo_layer_type": args.geo_layer_type,
             "geo_rank": args.geo_rank,
+            "geo_num_bases": args.geo_num_bases,
             "geo_hidden_dim": args.geo_hidden_dim,
             "geo_num_steps": args.geo_num_steps,
             "geo_max_velocity": args.geo_max_velocity,
+            "geo_residual_scale": args.geo_residual_scale,
             "controller_pool": args.controller_pool,
             "use_conv_stem": args.use_conv_stem,
             "stem_channels": args.stem_channels,
@@ -91,14 +103,26 @@ def geo_block_indices(model_variant, depth):
 def build_model(model_config):
     depth = model_config["depth"]
     geo_blocks = set(geo_block_indices(model_config["model_variant"], depth))
-    geo_layer = partial(
-        GeoDynamicLayer,
-        rank=model_config["geo_rank"],
-        num_steps=model_config["geo_num_steps"],
-        max_velocity=model_config["geo_max_velocity"],
-        controller_hidden_dim=model_config["geo_hidden_dim"],
-        controller_pool=model_config["controller_pool"],
-    )
+    if model_config["geo_layer_type"] == "flow":
+        geo_layer = partial(
+            FlowGeoDynamicLayer,
+            rank=model_config["geo_rank"],
+            num_steps=model_config["geo_num_steps"],
+            max_velocity=model_config["geo_max_velocity"],
+            controller_hidden_dim=model_config["geo_hidden_dim"],
+            controller_pool=model_config["controller_pool"],
+        )
+    elif model_config["geo_layer_type"] == "residual":
+        geo_layer = partial(
+            GeoDynamicLayer,
+            rank=model_config["geo_rank"],
+            num_bases=model_config["geo_num_bases"],
+            controller_hidden_dim=model_config["geo_hidden_dim"],
+            controller_pool=model_config["controller_pool"],
+            residual_scale=model_config["geo_residual_scale"],
+        )
+    else:
+        raise ValueError(f"Unsupported geo_layer_type: {model_config['geo_layer_type']}")
     block_linear_layers = [geo_layer if idx in geo_blocks else nn.Linear for idx in range(depth)]
 
     return VisionTransformer(
