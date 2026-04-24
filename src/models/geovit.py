@@ -1394,6 +1394,10 @@ class GeoVisionTransformer(nn.Module):
                 nn.init.trunc_normal_(self.summary_pos_embed, std=0.02)
                 nn.init.trunc_normal_(self.summary_type_embed, std=0.02)
         self.apply(self._init_weights)
+        # Re-run custom inits AFTER apply() so they take precedence
+        for module in self.modules():
+            if type(module).__name__ == "AttentionGatedFFN":
+                module._init_weights()
         self._reset_geo_operator_controllers()
         self.last_summary_stats: dict[str, float] = {}
 
