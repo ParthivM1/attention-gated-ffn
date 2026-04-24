@@ -11,10 +11,11 @@ conditioned on cross-token context.
 
 gate_mode options
 -----------------
-'attn'   : gate = sigmoid(W_gate @ LN(attn_out))         -- pure cross-token
-'dual'   : gate = sigmoid(W_a @ LN(attn_out) + W_x @ x) -- anchored to token
-'scale'  : gate = 1 + tanh(W_gate @ LN(attn_out))        -- multiplicative residual
-           (range [0,2]; default 1 = passthrough; can amplify or suppress)
+'attn'   : gate = sigmoid(W_gate @ LN(attn_out))               -- pure cross-token per token
+'dual'   : gate = sigmoid(W_a @ LN(attn_out) + W_x @ x)       -- anchored to token
+'scale'  : gate = 1 + tanh(W_gate @ LN(attn_out))              -- multiplicative residual [0,2]
+'cls'    : gate = sigmoid(W_gate @ LN(attn_out[:,0:1]))         -- CLS-only global gate
+           (broadcast from 1 token to all; cleaner global context, less noise per patch)
 
 Parameter count vs standard GELU MLP
 --------------------------------------
@@ -41,7 +42,7 @@ class AttentionGatedFFN(nn.Module):
         out_features: int,
         *,
         act_layer=nn.GELU,
-        gate_mode: str = "attn",   # 'attn' | 'dual' | 'scale'
+        gate_mode: str = "attn",   # 'attn' | 'dual' | 'scale' | 'cls'
         gate_ln: bool = True,      # LayerNorm attn_out before gate (prevents scale collapse)
         gate_init_scale: float = -1.0,  # -1 = auto 1/sqrt(hidden); >0 = explicit std
     ):
@@ -63,6 +64,7 @@ class AttentionGatedFFN(nn.Module):
             self.fc_gate_x = nn.Linear(self.in_features, self.hidden_features)
         else:
             self.fc_gate_x = None
+        # 'cls' mode: fc_gate takes in_features (CLS token) → hidden_features, broadcast to all tokens
 
         self.gate_init_scale = float(gate_init_scale)
         self.last_diagnostics: dict[str, float] = {}
@@ -97,7 +99,11 @@ class AttentionGatedFFN(nn.Module):
         gate_src = self.gate_ln(attn_out) if attn_out is not None else x
         content = self.act(self.fc_content(x))
 
-        if self.gate_mode == "dual":
+        if self.gate_mode == "cls":
+            # CLS token broadcasts a single global gate to all patch tokens
+            cls_src = self.gate_ln(attn_out[:, 0:1]) if attn_out is not None else x[:, 0:1]
+            gate = torch.sigmoid(self.fc_gate(cls_src))  # [B, 1, hidden] → broadcasts
+        elif self.gate_mode == "dual":
             # Anchor gate to token + cross-token bias
             logit = self.fc_gate(gate_src) + self.fc_gate_x(x)
             gate = torch.sigmoid(logit)

@@ -1649,7 +1649,7 @@ def add_args(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
     parser.add_argument("--agff-last-k-blocks", type=int, default=0,
                         help="Replace MLP with Attention-Gated FFN in last K blocks (0 disables)")
     parser.add_argument("--agff-gate-mode", type=str, default="attn",
-                        choices=["attn", "dual", "scale"],
+                        choices=["attn", "dual", "scale", "cls"],
                         help="Gate formulation: attn=sigmoid(W@LN(a)), dual=sigmoid(W@LN(a)+V@x), scale=1+tanh(W@LN(a))")
     parser.add_argument("--agff-gate-ln", action="store_true", default=True,
                         help="LayerNorm attn_out before gate (prevents scale collapse)")
