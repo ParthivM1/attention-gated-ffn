@@ -48,20 +48,15 @@ def evaluate_remote(checkpoint_name: str = None):
        cmd.extend(["--checkpoint_name", checkpoint_name])
   
    print("🚀 Launching:", " ".join(cmd))
-  
-   # Run the eval script
+  # Aarnav try and add debugging here, ill cache soon
    try:
        subprocess.run(cmd, cwd="/root/src", check=True)
    except subprocess.CalledProcessError as e:
-       print(f"❌ Evaluation failed with exit code {e.returncode}")
+       print(f"Evaluation failed with exit code {e.returncode}")
        raise e
 
 if __name__ == "__main__":
-    # How to run:
-    # 1. Automatic (latest checkpoint): modal run modal_eval.py
-    # 2. Specific checkpoint: modal run modal_eval.py --checkpoint-name geovit_e50.pth
-    
-    # Parse CLI args for modal run
+
     checkpoint_arg = None
     if "--checkpoint-name" in sys.argv:
         idx = sys.argv.index("--checkpoint-name")

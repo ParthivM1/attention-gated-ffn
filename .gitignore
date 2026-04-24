@@ -2,8 +2,35 @@ venv/
 .venv/
 __pycache__/
 *.pyc
+*.pyo
 .DS_Store
 .vscode/
 .idea/
 data/
 experiments/output/
+
+# Model checkpoints and weights
+checkpoints/
+*.pth
+*.pt
+*.ckpt
+
+# Training run logs and outputs
+runs/
+tmp/
+tmp_*/
+tmp_rotation_eval/
+
+# Temporary result files
+*.json.tmp
+
+# Working docs and scratch
+content/
+context/
+give_context/
+retok/
+tokenspawn/
+smoke_data_test/
+
+# Claude internal
+.claude/

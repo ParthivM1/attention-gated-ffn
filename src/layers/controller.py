@@ -81,3 +81,141 @@ class ResidualTangentController(nn.Module):
         coeff = torch.tanh(self.coeff_head(feat)) / math.sqrt(max(self.num_bases, 1))
         gate = torch.sigmoid(self.gate_head(feat))
         return coeff, gate
+
+
+class SandwichRotationController(nn.Module):
+    def __init__(
+        self,
+        input_dim,
+        num_rot_bases,
+        num_scale_bases,
+        hidden_dim=128,
+        rot_gate_bias=-4.0,
+        scale_gate_bias=-2.5,
+    ):
+        super().__init__()
+        self.num_rot_bases = num_rot_bases
+        self.num_scale_bases = num_scale_bases
+
+        self.net = nn.Sequential(
+            nn.LayerNorm(input_dim),
+            nn.Linear(input_dim, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.GELU(),
+        )
+        self.rot_coeff_head = nn.Linear(hidden_dim, num_rot_bases)
+        self.rot_gate_head = nn.Linear(hidden_dim, 1)
+        self.scale_coeff_head = nn.Linear(hidden_dim, num_scale_bases)
+        self.scale_gate_head = nn.Linear(hidden_dim, 1)
+
+        with torch.no_grad():
+            self.rot_coeff_head.weight.mul_(0.02)
+            self.rot_coeff_head.bias.zero_()
+            self.scale_coeff_head.weight.mul_(0.02)
+            self.scale_coeff_head.bias.zero_()
+            self.rot_gate_head.weight.zero_()
+            self.rot_gate_head.bias.fill_(rot_gate_bias)
+            self.scale_gate_head.weight.zero_()
+            self.scale_gate_head.bias.fill_(scale_gate_bias)
+
+    def forward(self, z):
+        feat = self.net(z)
+        rot_coeff = torch.tanh(self.rot_coeff_head(feat)) / math.sqrt(max(self.num_rot_bases, 1))
+        rot_gate = torch.sigmoid(self.rot_gate_head(feat))
+        scale_coeff = torch.tanh(self.scale_coeff_head(feat)) / math.sqrt(max(self.num_scale_bases, 1))
+        scale_gate = torch.sigmoid(self.scale_gate_head(feat))
+        return rot_coeff, rot_gate, scale_coeff, scale_gate
+
+
+class RotationLocalController(nn.Module):
+    def __init__(
+        self,
+        input_dim,
+        num_rot_bases,
+        num_scale_bases,
+        hidden_dim=128,
+        rot_gate_bias=-4.0,
+        local_gate_bias=-3.0,
+    ):
+        super().__init__()
+        self.num_rot_bases = num_rot_bases
+        self.num_scale_bases = num_scale_bases
+
+        self.net = nn.Sequential(
+            nn.LayerNorm(input_dim),
+            nn.Linear(input_dim, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.GELU(),
+        )
+        self.rot_coeff_head = nn.Linear(hidden_dim, num_rot_bases)
+        self.rot_gate_head = nn.Linear(hidden_dim, 1)
+        self.local_gate_head = nn.Linear(hidden_dim, 1)
+        self.scale_coeff_head = nn.Linear(hidden_dim, num_scale_bases)
+
+        with torch.no_grad():
+            self.rot_coeff_head.weight.mul_(0.02)
+            self.rot_coeff_head.bias.zero_()
+            self.scale_coeff_head.weight.mul_(0.02)
+            self.scale_coeff_head.bias.zero_()
+            self.rot_gate_head.weight.zero_()
+            self.rot_gate_head.bias.fill_(rot_gate_bias)
+            self.local_gate_head.weight.zero_()
+            self.local_gate_head.bias.fill_(local_gate_bias)
+
+    def forward(self, z):
+        feat = self.net(z)
+        rot_coeff = torch.tanh(self.rot_coeff_head(feat)) / math.sqrt(max(self.num_rot_bases, 1))
+        rot_gate = torch.sigmoid(self.rot_gate_head(feat))
+        local_gate = torch.sigmoid(self.local_gate_head(feat))
+        scale_coeff = torch.tanh(self.scale_coeff_head(feat)) / math.sqrt(max(self.num_scale_bases, 1))
+        return rot_coeff, rot_gate, local_gate, scale_coeff
+
+
+class LocalTokenController(nn.Module):
+    def __init__(self, input_dim, hidden_dim=128, local_gate_bias=-3.0):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.LayerNorm(input_dim),
+            nn.Linear(input_dim, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.GELU(),
+        )
+        self.local_gate_head = nn.Linear(hidden_dim, 1)
+
+        with torch.no_grad():
+            self.local_gate_head.weight.zero_()
+            self.local_gate_head.bias.fill_(local_gate_bias)
+
+    def forward(self, z):
+        feat = self.net(z)
+        return torch.sigmoid(self.local_gate_head(feat))
+
+
+class AdaptiveLocalController(nn.Module):
+    def __init__(self, input_dim, num_ops, hidden_dim=128, gate_bias=-3.0):
+        super().__init__()
+        self.num_ops = num_ops
+        self.net = nn.Sequential(
+            nn.LayerNorm(input_dim),
+            nn.Linear(input_dim, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.GELU(),
+        )
+        self.mix_logits_head = nn.Linear(hidden_dim, num_ops)
+        self.local_gate_head = nn.Linear(hidden_dim, 1)
+
+        with torch.no_grad():
+            self.mix_logits_head.weight.mul_(0.02)
+            self.mix_logits_head.bias.zero_()
+            self.local_gate_head.weight.zero_()
+            self.local_gate_head.bias.fill_(gate_bias)
+
+    def forward(self, z):
+        feat = self.net(z)
+        mix = torch.softmax(self.mix_logits_head(feat), dim=-1)
+        gate = torch.sigmoid(self.local_gate_head(feat))
+        return mix, gate
