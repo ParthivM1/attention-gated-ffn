@@ -278,6 +278,9 @@ class GeoVisionTransformer(nn.Module):
         fnfl_controller_hidden_dim: int = 128,
         fnfl_strength_init: float = 0.0,
         agff_last_k_blocks: int = 0,
+        agff_gate_mode: str = "attn",
+        agff_gate_ln: bool = True,
+        agff_gate_init_scale: float = -1.0,
         gfn_last_k_blocks: int = 0,
         gfn_corr_bottleneck: int = 32,
         gfn_n_train_iters: int = 1,
@@ -883,6 +886,9 @@ class GeoVisionTransformer(nn.Module):
         self.fnfl_controller_hidden_dim = max(int(fnfl_controller_hidden_dim), 1)
         self.fnfl_strength_init = float(fnfl_strength_init)
         self.agff_last_k_blocks = int(agff_last_k_blocks)
+        self.agff_gate_mode = str(agff_gate_mode)
+        self.agff_gate_ln = bool(agff_gate_ln)
+        self.agff_gate_init_scale = float(agff_gate_init_scale)
         self.gfn_last_k_blocks = int(gfn_last_k_blocks)
         self.gfn_corr_bottleneck = max(int(gfn_corr_bottleneck), 8)
         self.gfn_n_train_iters = max(int(gfn_n_train_iters), 1)
@@ -929,6 +935,9 @@ class GeoVisionTransformer(nn.Module):
                 in_features=embed_dim,
                 hidden_features=agff_hidden,
                 out_features=embed_dim,
+                gate_mode=self.agff_gate_mode,
+                gate_ln=self.agff_gate_ln,
+                gate_init_scale=self.agff_gate_init_scale,
             )
 
         def mlp_override_for_block(idx: int):

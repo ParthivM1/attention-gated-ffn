@@ -1018,6 +1018,9 @@ def apply_locked_smoke_protocol(args) -> None:
         "flow_depth_time_conditioning": {"--flow-depth-time-conditioning"},
         "flow_depth_attn_pool": {"--flow-depth-attn-pool"},
         "agff_last_k_blocks": {"--agff-last-k-blocks"},
+        "agff_gate_mode": {"--agff-gate-mode"},
+        "agff_gate_ln": {"--agff-gate-ln", "--no-agff-gate-ln"},
+        "agff_gate_init_scale": {"--agff-gate-init-scale"},
         "fnfl_last_k_blocks": {"--fnfl-last-k-blocks"},
         "fnfl_num_steps": {"--fnfl-num-steps"},
         "fnfl_rank": {"--fnfl-rank"},
@@ -1645,6 +1648,14 @@ def add_args(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
                         help="Use attention pooling head instead of CLS token")
     parser.add_argument("--agff-last-k-blocks", type=int, default=0,
                         help="Replace MLP with Attention-Gated FFN in last K blocks (0 disables)")
+    parser.add_argument("--agff-gate-mode", type=str, default="attn",
+                        choices=["attn", "dual", "scale"],
+                        help="Gate formulation: attn=sigmoid(W@LN(a)), dual=sigmoid(W@LN(a)+V@x), scale=1+tanh(W@LN(a))")
+    parser.add_argument("--agff-gate-ln", action="store_true", default=True,
+                        help="LayerNorm attn_out before gate (prevents scale collapse)")
+    parser.add_argument("--no-agff-gate-ln", action="store_false", dest="agff_gate_ln")
+    parser.add_argument("--agff-gate-init-scale", type=float, default=-1.0,
+                        help="Init std for gate weights; -1 = auto 1/sqrt(hidden)")
     parser.add_argument("--fnfl-last-k-blocks", type=int, default=0,
                         help="Replace MLP with Flow-Native FFN in this many last blocks (0 disables)")
     parser.add_argument("--fnfl-num-steps", type=int, default=2)
@@ -2097,6 +2108,9 @@ def build_model(
         geo_on_fc1=resolved_geo_on_fc1,
         geo_fc1_last_k_blocks=args.geo_fc1_last_k_blocks,
         agff_last_k_blocks=getattr(args, "agff_last_k_blocks", 0),
+        agff_gate_mode=getattr(args, "agff_gate_mode", "attn"),
+        agff_gate_ln=getattr(args, "agff_gate_ln", True),
+        agff_gate_init_scale=getattr(args, "agff_gate_init_scale", -1.0),
         fnfl_last_k_blocks=getattr(args, "fnfl_last_k_blocks", 0),
         fnfl_num_steps=getattr(args, "fnfl_num_steps", 2),
         fnfl_rank=getattr(args, "fnfl_rank", 64),

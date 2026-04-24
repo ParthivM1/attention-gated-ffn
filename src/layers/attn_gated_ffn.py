@@ -5,21 +5,20 @@ discards that signal before the FFN. AGFF feeds the attention output directly to
 a per-feature sigmoid gate inside the FFN, so each token's FFN transformation is
 conditioned on cross-token context.
 
-  content = act(W_content @ x)          -- token's own representation
-  gate    = sigmoid(W_gate   @ attn_out) -- what attention discovered
+  content = act(W_content @ x)            -- token's own representation
+  gate    = sigmoid(W_gate @ LN(attn_out)) -- what attention discovered
   out     = W_out @ (content * gate)
 
-Distinctions from prior work:
-- SwiGLU: gate = sigmoid(W @ x) — gate and content both from same token, no
-  cross-token information in gate.
-- AGFF:   gate = sigmoid(W @ attn_out) — gate conditioned on attended context
-  from ALL tokens, making the FFN input-adaptive at the cross-token level.
-- MoE: routing is discrete and learned separately; AGFF is a continuous
-  soft-gate that reuses the already-computed attention signal.
+gate_mode options
+-----------------
+'attn'   : gate = sigmoid(W_gate @ LN(attn_out))         -- pure cross-token
+'dual'   : gate = sigmoid(W_a @ LN(attn_out) + W_x @ x) -- anchored to token
+'scale'  : gate = 1 + tanh(W_gate @ LN(attn_out))        -- multiplicative residual
+           (range [0,2]; default 1 = passthrough; can amplify or suppress)
 
-Parameter count matches standard GELU MLP exactly: using hidden = round(8D/3)
-for two paths + output gives 3 * D * (8D/3) = 8D^2, same as fc1 (D->4D) +
-fc2 (4D->D). No extra parameters relative to the baseline.
+Parameter count vs standard GELU MLP
+--------------------------------------
+hidden = round(8D/3) → 3 × D × hidden ≈ 8D²  (exact parity with fc1+fc2)
 """
 from __future__ import annotations
 
@@ -42,25 +41,51 @@ class AttentionGatedFFN(nn.Module):
         out_features: int,
         *,
         act_layer=nn.GELU,
+        gate_mode: str = "attn",   # 'attn' | 'dual' | 'scale'
+        gate_ln: bool = True,      # LayerNorm attn_out before gate (prevents scale collapse)
+        gate_init_scale: float = -1.0,  # -1 = auto 1/sqrt(hidden); >0 = explicit std
     ):
         super().__init__()
         self.in_features = int(in_features)
-        self.hidden_features = int(hidden_features)  # = round(8 * D / 3) for param parity
+        self.hidden_features = int(hidden_features)
         self.out_features = int(out_features)
+        self.gate_mode = gate_mode.lower().strip()
 
         self.fc_content = nn.Linear(self.in_features, self.hidden_features)
-        self.fc_gate = nn.Linear(self.in_features, self.hidden_features)
         self.fc_out = nn.Linear(self.hidden_features, self.out_features)
         self.act = act_layer()
 
+        # Gate path
+        self.gate_ln = nn.LayerNorm(self.in_features) if gate_ln else nn.Identity()
+        self.fc_gate = nn.Linear(self.in_features, self.hidden_features)
+        if self.gate_mode == "dual":
+            # Second linear: x → gate logit (SwiGLU-style anchor)
+            self.fc_gate_x = nn.Linear(self.in_features, self.hidden_features)
+        else:
+            self.fc_gate_x = None
+
+        self.gate_init_scale = float(gate_init_scale)
         self.last_diagnostics: dict[str, float] = {}
         self._init_weights()
 
     def _init_weights(self) -> None:
+        # content and out: standard small init
         with torch.no_grad():
-            for fc in [self.fc_content, self.fc_gate, self.fc_out]:
+            for fc in [self.fc_content, self.fc_out]:
                 nn.init.trunc_normal_(fc.weight, std=0.02)
                 nn.init.zeros_(fc.bias)
+            # Gate init: larger std so gate has variance from epoch 0
+            # Auto = 1/sqrt(hidden) so W_gate @ LN(attn_out) has std~1 → gate_std~0.14
+            gate_std = (
+                1.0 / math.sqrt(self.hidden_features)
+                if self.gate_init_scale <= 0
+                else self.gate_init_scale
+            )
+            nn.init.trunc_normal_(self.fc_gate.weight, std=gate_std)
+            nn.init.zeros_(self.fc_gate.bias)
+            if self.fc_gate_x is not None:
+                nn.init.trunc_normal_(self.fc_gate_x.weight, std=0.02)
+                nn.init.zeros_(self.fc_gate_x.bias)
 
     def forward(
         self,
@@ -69,11 +94,19 @@ class AttentionGatedFFN(nn.Module):
         *,
         attn_out: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        # If no attn_out (e.g. mlp_first_update path), degrade gracefully to SwiGLU.
-        gate_src = attn_out if attn_out is not None else x
-
+        gate_src = self.gate_ln(attn_out) if attn_out is not None else x
         content = self.act(self.fc_content(x))
-        gate = torch.sigmoid(self.fc_gate(gate_src))
+
+        if self.gate_mode == "dual":
+            # Anchor gate to token + cross-token bias
+            logit = self.fc_gate(gate_src) + self.fc_gate_x(x)
+            gate = torch.sigmoid(logit)
+        elif self.gate_mode == "scale":
+            # Multiplicative residual: default 1 (pass-through), range [0, 2]
+            gate = 1.0 + torch.tanh(self.fc_gate(gate_src))
+        else:  # 'attn'
+            gate = torch.sigmoid(self.fc_gate(gate_src))
+
         out = self.fc_out(content * gate)
 
         with torch.no_grad():
@@ -81,6 +114,9 @@ class AttentionGatedFFN(nn.Module):
                 "agff_gate_mean": float(gate.mean().item()),
                 "agff_gate_std": float(gate.std().item()),
                 "agff_using_attn": float(attn_out is not None),
+                "agff_gate_mode_attn": float(self.gate_mode == "attn"),
+                "agff_gate_mode_dual": float(self.gate_mode == "dual"),
+                "agff_gate_mode_scale": float(self.gate_mode == "scale"),
             }
         return out
 
