@@ -1021,6 +1021,7 @@ def apply_locked_smoke_protocol(args) -> None:
         "agff_gate_mode": {"--agff-gate-mode"},
         "agff_gate_ln": {"--agff-gate-ln", "--no-agff-gate-ln"},
         "agff_gate_init_scale": {"--agff-gate-init-scale"},
+        "agff_hidden_scale": {"--agff-hidden-scale"},
         "fnfl_last_k_blocks": {"--fnfl-last-k-blocks"},
         "fnfl_num_steps": {"--fnfl-num-steps"},
         "fnfl_rank": {"--fnfl-rank"},
@@ -1656,6 +1657,8 @@ def add_args(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
     parser.add_argument("--no-agff-gate-ln", action="store_false", dest="agff_gate_ln")
     parser.add_argument("--agff-gate-init-scale", type=float, default=-1.0,
                         help="Init std for gate weights; -1 = auto 1/sqrt(hidden)")
+    parser.add_argument("--agff-hidden-scale", type=float, default=8.0/3.0,
+                        help="hidden = round(D * scale); default 8/3 for param parity with plain MLP")
     parser.add_argument("--fnfl-last-k-blocks", type=int, default=0,
                         help="Replace MLP with Flow-Native FFN in this many last blocks (0 disables)")
     parser.add_argument("--fnfl-num-steps", type=int, default=2)
@@ -2111,6 +2114,7 @@ def build_model(
         agff_gate_mode=getattr(args, "agff_gate_mode", "attn"),
         agff_gate_ln=getattr(args, "agff_gate_ln", True),
         agff_gate_init_scale=getattr(args, "agff_gate_init_scale", -1.0),
+        agff_hidden_scale=getattr(args, "agff_hidden_scale", 8.0/3.0),
         fnfl_last_k_blocks=getattr(args, "fnfl_last_k_blocks", 0),
         fnfl_num_steps=getattr(args, "fnfl_num_steps", 2),
         fnfl_rank=getattr(args, "fnfl_rank", 64),

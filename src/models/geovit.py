@@ -281,6 +281,7 @@ class GeoVisionTransformer(nn.Module):
         agff_gate_mode: str = "attn",
         agff_gate_ln: bool = True,
         agff_gate_init_scale: float = -1.0,
+        agff_hidden_scale: float = 8.0 / 3.0,  # hidden = round(D * scale); default = param parity
         gfn_last_k_blocks: int = 0,
         gfn_corr_bottleneck: int = 32,
         gfn_n_train_iters: int = 1,
@@ -889,6 +890,7 @@ class GeoVisionTransformer(nn.Module):
         self.agff_gate_mode = str(agff_gate_mode)
         self.agff_gate_ln = bool(agff_gate_ln)
         self.agff_gate_init_scale = float(agff_gate_init_scale)
+        self.agff_hidden_scale = float(agff_hidden_scale)
         self.gfn_last_k_blocks = int(gfn_last_k_blocks)
         self.gfn_corr_bottleneck = max(int(gfn_corr_bottleneck), 8)
         self.gfn_n_train_iters = max(int(gfn_n_train_iters), 1)
@@ -930,7 +932,7 @@ class GeoVisionTransformer(nn.Module):
                 return None
             if idx < max(depth - self.agff_last_k_blocks, 0):
                 return None
-            agff_hidden = int(round(embed_dim * 8 / 3))
+            agff_hidden = int(round(embed_dim * self.agff_hidden_scale))
             return AttentionGatedFFN(
                 in_features=embed_dim,
                 hidden_features=agff_hidden,
